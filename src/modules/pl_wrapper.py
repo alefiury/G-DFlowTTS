@@ -1,0 +1,463 @@
+import os
+import sys
+import random
+from dataclasses import dataclass, field
+from typing import Optional
+
+sys.path.append(os.getcwd())
+
+from typing import Tuple, List, Dict, Any, Union
+
+import torch
+import wandb
+from tqdm import tqdm
+import torchaudio
+from torch import Tensor
+import lightning as L
+from lion_pytorch import Lion
+import torch.nn.functional as F
+from omegaconf import DictConfig
+from torch.optim import Adam, AdamW
+from lightning.pytorch.utilities import grad_norm
+from xcodec2.modeling_xcodec2 import XCodec2Model
+from torch.distributions.categorical import Categorical
+
+from modules.model import Transformer
+from utils.tokenizer import VoiceBpeTokenizer
+from dataset.build_dataset import build_dataset
+from utils.lr_schedulers import CosineWarmupLR, LinearLR
+from modules.flow import (
+    MixtureDiscreteProbPath,
+    PolynomialConvexScheduler,
+    MaskedSourceDistribution,
+    UniformSourceDistribution
+)
+from dataset.dataloader import DynamicSingleSpeakerCollateFunc, OfflineMultipleSpeakerMaskCollateFunc
+
+
+class DFMTTSWrapper(L.LightningModule):
+    def __init__(
+        self,
+        config: DictConfig,
+    ):
+        super().__init__()
+        self.config = config
+
+        if self.config.source_dist_type == "uniform":
+            self.source_distribution = UniformSourceDistribution(
+                vocab_size=self.config.datasets.audio_vocab_size
+            )
+        elif self.config.source_dist_type == "mask":
+            self.source_distribution = MaskedSourceDistribution(
+                mask_token=self.config.datasets.audio_mask_token
+            )
+        else:
+            raise ValueError(f"Invalid source distribution: {self.config.source_dist_type}")
+
+        self.path = MixtureDiscreteProbPath(
+            scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
+        )
+
+        self.criteria = torch.nn.CrossEntropyLoss(reduction="none")
+
+        self.model = Transformer(**self.config.model)
+
+        if config.datasets.type == "dynamic":
+            self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
+
+    def on_save_checkpoint(self, checkpoint):
+        # Remove all parameters whose keys start with "audio_codec"
+        state_dict = checkpoint["state_dict"]
+        keys_to_remove = [key for key in state_dict if key.startswith("audio_codec")]
+        for key in keys_to_remove:
+            del state_dict[key]
+
+    def setup(self, stage: str):
+        # Assign train/val datasets for use in dataloaders
+        if stage == "fit":
+            self.train_dataset, self.val_dataset = build_dataset(self.config)
+
+    def train_dataloader(self):
+        """Return the training dataloader."""
+        if self.config.datasets.type == "dynamic":
+            collate_fn = DynamicSingleSpeakerCollateFunc()
+        elif self.config.datasets.type == "offline":
+            collate_fn = OfflineMultipleSpeakerMaskCollateFunc(
+                max_audio_length=self.config.datasets.max_audio_length,
+                mask_prob=self.config.datasets.mask_prob,
+                audio_mask_token=self.config.datasets.audio_mask_token,
+                audio_pad_token=self.config.datasets.audio_pad_token,
+                text_pad_token=self.config.datasets.text_pad_token,
+                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+            )
+        else:
+            raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
+
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.config.train.batch_size,
+            shuffle=self.config.train.shuffle,
+            num_workers=self.config.train.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
+
+    def val_dataloader(self):
+        if self.config.datasets.type == "dynamic":
+            collate_fn = DynamicSingleSpeakerCollateFunc()
+        elif self.config.datasets.type == "offline":
+            collate_fn = OfflineMultipleSpeakerMaskCollateFunc(
+                max_audio_length=self.config.datasets.max_audio_length,
+                mask_prob=self.config.datasets.mask_prob,
+                audio_mask_token=self.config.datasets.audio_mask_token,
+                audio_pad_token=self.config.datasets.audio_pad_token,
+                text_pad_token=self.config.datasets.text_pad_token,
+                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+            )
+        else:
+            raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
+
+        return torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.config.train.batch_size,
+            shuffle=False,
+            num_workers=self.config.train.num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
+
+    def num_training_steps(self) -> int:
+        """Total training steps inferred from datamodule and devices."""
+        dataset = self.train_dataloader()
+        if self.trainer.max_steps and self.trainer.max_steps > 0:
+            return self.trainer.max_steps
+        dataset_size = len(dataset)
+
+        gpu_count = self.trainer.num_devices if self.trainer.num_devices else 1
+        accumulate_grad_batches = self.trainer.accumulate_grad_batches
+
+        effective_batches = dataset_size // (gpu_count * accumulate_grad_batches)
+
+        return effective_batches * self.trainer.max_epochs
+
+    def configure_optimizers(self):
+        """Configures the optimizer and the learning rate scheduler."""
+        # Start dataloaders to be able to get the number of steps per epoch
+        self.trainer.fit_loop.setup_data()
+
+        max_num_steps = self.num_training_steps()
+
+        print(f"Max number of steps: {max_num_steps}")
+
+        opt_params = self.config.optimizer["params"]
+        scheduler_params = self.config.scheduler["params"]
+
+        # Exclude bias and normalization layers from weight decay
+        # As it can be seen in https://arxiv.org/pdf/2106.15739 and https://discuss.pytorch.org/t/weight-decay-in-the-optimizers-is-a-bad-idea-especially-with-batchnorm/16994
+        # Inspired by https://github.com/mlfoundations/open_clip/blob/49eac2f27a5bb98a7f7ecc1154918880aa55256c/src/open_clip_train/main.py#L312
+        exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n
+        include = lambda n, p: not exclude(n, p)
+
+        named_parameters = list(self.model.named_parameters())
+        gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
+        rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
+
+        if self.config.optimizer.name.lower() == "adam":
+            print("Using Adam optimizer")
+            optimizer = Adam(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": opt_params["weight_decay"]},
+                ],
+                lr=opt_params["learning_rate"],
+                eps=opt_params["eps"],
+                betas=opt_params["betas"],
+                weight_decay=opt_params["weight_decay"]
+            )
+
+        elif self.config.optimizer.name.lower() == "adamw":
+            optimizer = AdamW(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": opt_params["weight_decay"]},
+                ],
+                lr=opt_params["learning_rate"],
+                eps=opt_params["eps"],
+                betas=opt_params["betas"],
+                weight_decay=opt_params["weight_decay"]
+            )
+
+        elif self.config.optimizer.name.lower() == "lion":
+            optimizer = Lion(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": opt_params["weight_decay"]},
+                ],
+                lr=opt_params["learning_rate"],
+                betas=opt_params["betas"],
+                weight_decay=opt_params["weight_decay"],
+                use_triton=opt_params.get("use_triton", False),
+            )
+
+        else:
+            raise ValueError(f"Invalid optimizer: {self.config.optimizer.name}")
+
+        if not self.config["scheduler"]:
+            return optimizer
+
+        scheduler = None
+        if self.config.scheduler.name.lower() == "reducelronplateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                "min",
+                patience=scheduler_params.get("patience", max_num_steps*0.25),
+                factor=0.9,
+                min_lr=opt_params.get("min_learning_rate", 1.0e-6)
+            )
+
+        if self.config.scheduler.name.lower() == "cosinewarmuplr":
+            scheduler = CosineWarmupLR(
+                optimizer,
+                lr_min=opt_params.get("min_learning_rate", 1.0e-6),
+                lr_max=opt_params["learning_rate"],
+                warmup=scheduler_params.get("warmup_lr", max_num_steps*0.05),
+                T_max=max_num_steps
+            )
+
+        if self.config.scheduler.name.lower() == "linearlr":
+            scheduler = LinearLR(
+                optimizer,
+                start_factor=scheduler_params.get("start_factor", 1.0 / 3.0),
+                end_factor=scheduler_params.get("end_factor", 1.0),
+                total_iters=scheduler_params.get("total_iters", 5),
+                last_epoch=scheduler_params.get("last_epoch", -1),
+                verbose=scheduler_params.get("verbose", False)
+            )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            }
+        }
+
+    def on_before_optimizer_step(self, optimizer):
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
+        norms = grad_norm(self.model, norm_type=2)
+        self.log_dict(norms)
+
+    def forward(
+        self,
+        x_t: Tensor,
+        text_ids: Tensor,
+        cond_ids: Tensor,
+        time: Tensor,
+        drop_text: bool = False,
+        drop_cond: bool = False,
+    ) -> Tuple[Tensor, Tensor]:
+        return self.model(
+            x_t=x_t,
+            text=text_ids,
+            cond=cond_ids,
+            time=time,
+            drop_text=drop_text,
+            drop_cond=drop_cond,
+        )
+
+    def get_speech_token(self, input_waveform, input_features):
+        """
+        Extract speech token sequence using the encoder.
+        It is assumed that encoder.encode_batch_feats returns a tensor whose shape could be (B, 1, seq_len) or (B, seq_len).
+        If the returned shape is (B, 1, seq_len), squeeze out the 1st dimension.
+        """
+        with torch.no_grad():
+            speech_tokens = self.audio_codec.encode_batch_feats(
+                input_waveform=input_waveform,
+                input_features=input_features
+            )
+        if speech_tokens.dim() == 3 and speech_tokens.size(1) == 1:
+            speech_tokens = speech_tokens.squeeze(1)
+        return speech_tokens.long()
+
+    def training_step(self, batch, batch_idx):
+        if self.config.datasets.type == "dynamic":
+            input_waveform, input_features, transcription_ids = batch
+            x_1 = self.get_speech_token(input_waveform, input_features)
+        elif self.config.datasets.type == "offline":
+            x_1, transcription_ids, cond, mask = batch
+
+        with torch.no_grad():
+            x_0 = self.source_distribution.sample_like(x_1)
+            t = torch.rand(x_1.shape[0], device=x_1.device)
+            path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+
+        drop_cond = random.random() < self.config.datasets.ref_drop_prob
+        if random.random() < self.config.datasets.cond_drop_prob:
+            drop_cond = True
+            drop_text = True
+        else:
+            drop_text = False
+
+        # Assert to verify correctness when the conditional drop probability is set to 0
+        if self.config.datasets.assert_drop_prob:
+            assert drop_text == False and drop_cond == False, "Drop text and cond should be False for training"
+
+        logits = self(
+            x_t=path_sample.x_t,
+            text_ids=transcription_ids,
+            cond_ids=cond,
+            time=path_sample.t,
+            drop_text=drop_text,
+            drop_cond=drop_cond,
+        )
+
+        loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        # Apply mask to the loss
+        loss = loss[mask.flatten(0, 1).bool()].mean()
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        if self.config.datasets.type == "dynamic":
+            input_waveform, input_features, transcription_ids = batch
+            x_1 = self.get_speech_token(input_waveform, input_features)
+        elif self.config.datasets.type == "offline":
+            x_1, transcription_ids, cond, mask = batch
+
+        with torch.no_grad():
+            x_0 = self.source_distribution.sample_like(x_1)
+            t = torch.rand(x_1.shape[0], device=x_1.device)
+            path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+
+        logits = self(
+            x_t=path_sample.x_t,
+            text_ids=transcription_ids,
+            cond_ids=cond,
+            time=path_sample.t,
+            drop_text=False,
+            drop_cond=False,
+        )
+
+        print(mask)
+        loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        # Apply mask to the loss
+        loss = loss[mask.flatten(0, 1).bool()].mean()
+        self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+
+        if batch_idx == 0:
+            try:
+                self.sample_validation()
+            except Exception as e:
+                print(f"Error during validation sample generation: {e}")
+                wandb.log({"validation_sample": None})
+                pass
+        return loss
+
+    @torch.no_grad()
+    def sample_validation(self):
+        audio_ref_path = self.config.test.audio_ref_path
+        text_ref = self.config.test.text_ref
+
+        audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec).to(self.device)
+        audio_ref, audio_ref_sr = torchaudio.load(audio_ref_path)
+        # audio_ref = audio_ref.to(self.device)
+
+        print(f"Audio reference shape: {audio_ref.shape}")
+
+        if audio_ref_sr != self.config.datasets.sampling_rate:
+            audio_ref = torchaudio.transforms.Resample(audio_ref_sr, self.config.datasets.sampling_rate)(audio_ref)
+
+        print(f"Audio reference shape: {audio_ref.shape}")
+
+        codes_ref = audio_codec.encode_code(input_waveform=audio_ref).squeeze()
+
+        print(f"Codes reference shape: {codes_ref.shape}")
+
+        # pad codes_ref to have the same length as the model's max_length
+        if codes_ref.size(0) < self.config.datasets.max_audio_length:
+            codes_ref = F.pad(
+                codes_ref,
+                (0, self.config.test.max_audio_length - codes_ref.size(0)),
+                value=self.config.datasets.audio_mask_token
+            )
+
+        print(f"Padded codes reference shape: {codes_ref.shape}")
+        codes_ref = codes_ref.unsqueeze(0).to(self.device)
+
+        text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
+
+        vocab_size = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        max_length = self.config.test.max_audio_length
+        generated_audios = {}
+        # Iterate over each test sentence from config
+        for idx, sentence in tqdm(enumerate(self.config.test.sentences), total=len(self.config.test.sentences)):
+            print(f"\nGenerating audio for sentence: {sentence}")
+            augmented_sentence = text_ref + " " + sentence
+            print(f"Augmented sentence: {augmented_sentence}")
+            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en")).to(self.device).unsqueeze(0)
+            print(f"Text IDs: {text_ids.shape}", torch.min(text_ids), torch.max(text_ids))
+            # Initialize xt with mask token (batch size = 1)
+            x_t = self.source_distribution.sample((1, max_length), device=self.device)
+            print("11111", x_t)
+            print(f"Initial x_t: {x_t.shape}, {torch.min(x_t)}, {torch.max(x_t)}")
+            print(f"Initial codes_ref: {codes_ref.shape}, {torch.min(codes_ref)}, {torch.max(codes_ref)}")
+            print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
+
+            num_steps = self.config.test.nsf
+            eps = 1e-9
+            t_init = 0.0
+            t_final = 1.0
+            time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=self.device)
+
+            # Run the flow-matching inference loop
+            for i in tqdm(range(num_steps), total=num_steps):
+                t = time_grid[i : i + 1]         # current time, shape [1]
+                h = time_grid[i + 1] - time_grid[i]  # step size (scalar)
+                # Get Conditional Logits
+                logits = self(
+                    x_t=x_t,
+                    text_ids=text_ids,
+                    cond_ids=codes_ref,
+                    time=t,
+                    drop_text=False,
+                    drop_cond=False,
+                )
+                p1 = torch.softmax(logits, dim=-1)
+                one_hot_x_t = torch.nn.functional.one_hot(x_t, num_classes=vocab_size).float()
+                # Compute the velocity update using the denoiser formulation
+                # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
+                u = (p1 - one_hot_x_t) / (1.0 - t.item() + eps)
+                # Euler update: compute new probabilities and sample the updated state
+                new_probs = one_hot_x_t + h * u
+                new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
+                x_t = torch.distributions.Categorical(probs=new_probs).sample()
+            # remove making tokens from the generated sequence
+            x_t = x_t.squeeze(0)
+            print("Shape after squeeze:", x_t.shape)
+            x_t = x_t[x_t != self.config.datasets.audio_mask_token]
+            print("Shape after mask removal:", x_t.shape)
+            # remove padding tokens from the generated sequence
+            x_t = x_t[x_t != self.config.datasets.audio_pad_token]
+            print("Shape after pad removal:", x_t.shape)
+            x_t = x_t.unsqueeze(0).unsqueeze(0)
+            print("Final Shape", x_t.shape)
+            # Decode the final token sequence into an audio waveform
+            if self.config.datasets.type == "dynamic":
+                generated_audio = self.audio_codec.decode_code(x_t)
+            elif self.config.datasets.type == "offline":
+                generated_audio = audio_codec.decode_code(x_t)
+            # Use a truncated version of the sentence for the log key (replace spaces with underscores)
+            key = f"generated_audio_{idx}"
+            generated_audios[key] = wandb.Audio(
+                generated_audio[0, 0, :].cpu().numpy(),
+                sample_rate=self.config.datasets.sampling_rate,
+                caption=sentence
+            )
+        wandb.log(generated_audios)
+
