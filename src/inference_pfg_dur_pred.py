@@ -25,6 +25,7 @@ from torch.distributions.categorical import Categorical
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from modules.pl_wrapper import DFMTTSWrapper
+from modules.dp_wrapper import DurationPredictorWrapper
 from utils.tokenizer import VoiceBpeTokenizer
 
 
@@ -42,19 +43,36 @@ class MaskedSourceDistribution():
     def sample_like(self, tensor_like: Tensor) -> Tensor:
         return torch.zeros_like(tensor_like).fill_(self.mask_token).long()
 
+
+def get_remaining_duration(
+    duration_model: DurationPredictorWrapper,
+    text_ids: Tensor,
+    codes_ref: Tensor,
+    device: torch.device
+) -> Tensor:
+    bos_vec = codes_ref.new_full((1,), 65536)
+    codes_ref = torch.cat((bos_vec, codes_ref), dim=0)   # [C, dur+1]
+
+    remaining_duration = duration_model(
+        text_ids=text_ids,
+        audio_ids=codes_ref.unsqueeze(0).to(device)
+    )
+    return torch.argmax(remaining_duration[:, -1], dim=-1).item()
+
+
 @torch.inference_mode()
 def inference(
     config,
     model,
+    duration_model,
     tokenizer,
     sentence,
     nsf: int = 10,
+    text_ref: str = None,
     codes_ref: Tensor = None,
     sequence_length: int = 300,
     device: torch.device = torch.device("cuda")
 ) -> Tensor:
-    # text_ref = "in being comparatively modern."
-    text_ref = "O que ela disse? E como é que ela sabia que nós estávamos lá, afinal?"
     augmented_sentence = text_ref + " " + sentence
     # text_ids = tokenizer.encode(augmented_sentence, lang="en-us")
     text_ids = tokenizer.encode(augmented_sentence, lang="pt-br")
@@ -72,8 +90,19 @@ def inference(
 
     # Create a time grid from 0 to 1 with (num_steps + 1) points
     t_init = 0.0
-    t_final = 1.0
+    t_final = 2.0
     time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=device)
+
+    sequence_length = get_remaining_duration(
+        duration_model,
+        text_ids=text_ids,
+        codes_ref=codes_ref,
+        device=device
+    )
+
+    print("-"*100)
+    print("Predicted sequence length:", sequence_length)
+    print("codes_ref.size(0):", codes_ref.size(0))
 
     # Initialize x_t; for example, using the masked source
     xt = source_distribution.sample((1, sequence_length + codes_ref.size(0)), device=device)
@@ -89,19 +118,19 @@ def inference(
     if codes_ref.size(0) < sequence_length + codes_ref.size(0):
         codes_ref = F.pad(codes_ref, (0, sequence_length), value=config.datasets.audio_mask_token).unsqueeze(0)
 
-    print(codes_ref)
-    print(codes_ref.shape)
+    # print(codes_ref)
+    # print(codes_ref.shape)
 
     num_steps = nsf
     dt = 1.0 / num_steps
     x1_temp = 1.0
     guidance_scale = config.datasets.guidance_scale
     # gamma = config.datasets.guidance_scale
-    gamma = 1
+    gamma = 3.0
     mask_token_id = config.datasets.audio_mask_token
     S = vocab_size
     eps = 1e-9
-    noise = 0.1
+    noise = 0.0
 
     mask_one_hot = torch.zeros((S), device=model.device)
     mask_one_hot[mask_token_id] = 1.0
@@ -143,16 +172,34 @@ def inference(
 
         xt = torch.multinomial(P.view(-1, S), 1).view_as(xt)
 
+        # for _ in range(num_corrector_steps):
+        #     # Use a smaller corrector step (for example, 10% of h)
+        #     h_corr = dt * 0.1
+        #     logits_corr = model(xt, text_ids, codes_ref, t_tensor, False, False)
+        #     p1_corr = torch.softmax(logits_corr, dim=-1)
+        #     one_hot_x_t_corr = torch.nn.functional.one_hot(xt, num_classes=vocab_size).float()
+
+        #     # Compute the corrector velocity similarly
+        #     u_corr = (p1_corr - one_hot_x_t_corr) / (1.0 - t_tensor.item() + 1e-8)
+        #     new_probs_corr = one_hot_x_t_corr + h_corr * u_corr
+        #     new_probs_corr = new_probs_corr / new_probs_corr.sum(dim=-1, keepdim=True)
+        #     xt = torch.distributions.Categorical(probs=new_probs_corr).sample()
+
     return xt
+
 
 @torch.no_grad()
 def main() -> None:
-    output_dir = "outputs_pfg_v2"
+    output_dir = "outputs_pfg_pred_dur"
     gpu = 0
-    config_path = "/raid/aluno_alef/DFM-TTS-2/config/default_offline_bpe.yaml"
-    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/q0krokde/checkpoints/epoch=69-step=354200-val/loss_epoch=3.416.ckpt"
+    config_path = "/raid/aluno_alef/DFM-TTS-2/config/default_offline_bpe_en.yaml"
+    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/y8jgjqp0/checkpoints/epoch=11-step=206400-val/loss_epoch=3.724.ckpt"
+
+    duration_pred_config_path = "/raid/aluno_alef/DFM-TTS-2/config/duration_predictor_bpe_en.yaml"
+    duration_pred_pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/Duration-Predictor-DFM-TTS/61g87haf/checkpoints/epoch=10-step=138116-val/loss_epoch=4.717.ckpt"
 
     config = OmegaConf.load(config_path)
+    duration_pred_config = OmegaConf.load(duration_pred_config_path)
 
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -160,37 +207,43 @@ def main() -> None:
     model = DFMTTSWrapper.load_from_checkpoint(pretrained_checkpoint, config=config, map_location=device, strict=False)
     model.eval()
 
+    duration_model = DurationPredictorWrapper.load_from_checkpoint(
+        duration_pred_pretrained_checkpoint,
+        config=duration_pred_config,
+        map_location=device,
+        strict=False
+    )
+    duration_model.eval()
+
     audio_codec = XCodec2Model.from_pretrained(config.datasets.audio_codec).to(device)
     audio_codec.eval()
 
-    # ref_path = "/hadatasets/alef.ferreira/DFM-TTS-2/src/samples/LJ001-0002.wav"
-    ref_path = "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5/bbd699/100/a600e123eb.wav"
+    ref_path = "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    # ref_path = "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5/bbd699/100/a600e123eb.wav"
 
     audio_ref, audio_ref_sr = torchaudio.load(ref_path)
     if audio_ref_sr != 16000:
         audio_ref = torchaudio.transforms.Resample(audio_ref_sr, 16000)(audio_ref)
 
-    print(f"Audio reference shape: {audio_ref.shape}")
-
     codes_ref = audio_codec.encode_code(input_waveform=audio_ref).squeeze()
 
-    # sentences = [
-    #     "Printing, in the only sense with which we are at present concerned, differs from most if not from all the arts and crafts represented in the Exhibition",
-    #     "For although the Chinese took impressions from wood blocks engraved in relief for centuries before the woodcutters of the Netherlands, by a similar process",
-    #     "Hello, how are you?",
-    #     "The quick brown fox jumps over the lazy dog.",
-    #     "The five boxing wizards jump quickly.",
-    #     "How razorback-jumping frogs can level six piqued gymnasts!",
-    #     "Pack my box with five dozen liquor jugs."
-    # ]
-
     sentences = [
-        "Embora estivesse chovendo, eles decidiram passear na floresta.",
-        "Por causa do trânsito intenso, chegamos à reunião um pouco atrasados.",
-        "Se você quer ter sucesso, deve estar preparado para trabalhar muito duro e manter o foco.",
-        "Antes de sair de férias, lembre-se de regar as plantas e trancar todas as portas.",
-        "Depois de terminar o trabalho, ele relaxou ouvindo música clássica e lendo um livro.",
+        "Active artists always appreciate artistic achievements and applaud awesome artworks.",
+        "Brave bakers boldly baked big batches of brownies in beautiful bakeries.",
+        "Daring dancers dazzled during dynamic dance displays, drawing delighted crowds.",
+        "Excited engineers eagerly enjoyed exploring enormous engineering exhibits.",
+        "Friendly farmers faithfully fostered fields, favoring fruitful crops.",
+        "Gallant gophers gracefully gambled golden gooseberries on grandiose glaciers.",
+        "Happy hikers harmoniously hiked through hilly landscapes on heavenly holidays."
     ]
+
+    # sentences = [
+    #     "Embora estivesse chovendo, eles decidiram passear na floresta.",
+    #     "Por causa do trânsito intenso, chegamos à reunião um pouco atrasados.",
+    #     "Se você quer ter sucesso, deve estar preparado para trabalhar muito duro e manter o foco.",
+    #     "Antes de sair de férias, lembre-se de regar as plantas e trancar todas as portas.",
+    #     "Depois de terminar o trabalho, ele relaxou ouvindo música clássica e lendo um livro.",
+    # ]
 
     nsf = [128, 256, 512, 1024, 2048]
 
@@ -199,9 +252,21 @@ def main() -> None:
     for idx, sentence in enumerate(sentences):
         print(f"Processing sentence {idx + 1}/{len(sentences)}")
         for n in tqdm(nsf):
-            x_t = inference(config, model, tokenizer, sentence, nsf=n, codes_ref=codes_ref, device=device)
+            text_ref = "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
+            x_t = inference(
+                config=config,
+                model=model,
+                duration_model=duration_model,
+                tokenizer=tokenizer,
+                sentence=sentence,
+                nsf=n,
+                text_ref=text_ref,
+                codes_ref=codes_ref,
+                device=device
+            )
             # remove making tokens from the generated sequence
             x_t = x_t.squeeze(0)
+            x_t = x_t[codes_ref.size(0):]
             print("1", x_t.shape)
             x_t = x_t[x_t != config.datasets.audio_mask_token]
             print("2", x_t.shape)

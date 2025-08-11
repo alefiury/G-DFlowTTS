@@ -11,7 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from modules.pl_wrapper import DFMTTSWrapper
+from modules.dp_wrapper import DurationPredictorWrapper
 
 torch.autograd.set_detect_anomaly(True) # for debugging
 
@@ -44,7 +44,7 @@ def main() -> None:
         "--checkpoint-dir",
         required=False,
         type=str,
-        default="../checkpoints/DFMTTS"
+        default="../checkpoints/Duration-Predictor"
     )
     parser.add_argument(
         "-pc",
@@ -78,18 +78,6 @@ def main() -> None:
         config=OmegaConf.to_container(config, resolve=True)
     )
 
-    if config.test.get("log_audio_ref", False):
-        wav, sr = torchaudio.load(config.test.audio_ref_path)
-        wandb.log(
-            {
-                "audio_ref": wandb.Audio(
-                    wav.squeeze(0).numpy(),
-                    sample_rate=sr,
-                    caption=config.test.text_ref,
-                ),
-            }
-        )
-
     config["model_checkpoint"].pop("dirpath")
 
     callbacks = [
@@ -97,13 +85,7 @@ def main() -> None:
         LearningRateMonitor("step"),
     ]
 
-    if args.pretrained_checkpoint is not None:
-        print("*"*100)
-        print("Fine-tuning from checkpoint:", args.pretrained_checkpoint)
-        model = DFMTTSWrapper.load_from_checkpoint(args.pretrained_checkpoint, config=config)
-        print("Loaded model from checkpoint:", args.pretrained_checkpoint)
-    else:
-        model = DFMTTSWrapper(config=config)
+    model = DurationPredictorWrapper(config=config)
 
     print(model)
 

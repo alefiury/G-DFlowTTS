@@ -36,6 +36,7 @@ def libri_tts(root_path, meta_files=None, ignored_speakers=None, base_dir_to_rem
                     "filename": filename,
                     "speaker_name": f"LTTS_{speaker_name}",
                     "root_path": root_path,
+                    "language": "en",
                 })
 
     print(f"Number of items (before file check): {len(items)}")
@@ -50,13 +51,13 @@ def libri_tts(root_path, meta_files=None, ignored_speakers=None, base_dir_to_rem
 
 
 def main():
-    base_dir_to_remove = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/"
-    output_dir = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R_xcodec2"
-    libritts_r_base_dir_100 = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/train-clean-100/"
-    libritts_r_base_dir_360 = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/train-clean-360/"
-    libritts_r_base_dir_500 = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/train-other-500/"
-    libritts_r_dev_dir = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/dev-clean/"
-    libritts_r_test_dir = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/test-clean/"
+    base_dir_to_remove = "/raid/aluno_alef/DATASETS/LibriTTS_R"
+    output_dir = "/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R"
+    libritts_r_base_dir_100 = "/raid/aluno_alef/DATASETS/LibriTTS_R/train-clean-100/"
+    libritts_r_base_dir_360 = "/raid/aluno_alef/DATASETS/LibriTTS_R/train-clean-360/"
+    libritts_r_base_dir_500 = "/raid/aluno_alef/DATASETS/LibriTTS_R/train-other-500/"
+    libritts_r_dev_dir = "/raid/aluno_alef/DATASETS/LibriTTS_R/dev-clean/"
+    libritts_r_test_dir = "/raid/aluno_alef/DATASETS/LibriTTS_R/test-clean/"
 
     libri_tts_100 = libri_tts(libritts_r_base_dir_100, base_dir_to_remove=base_dir_to_remove)
     libri_tts_360 = libri_tts(libritts_r_base_dir_360, base_dir_to_remove=base_dir_to_remove)
@@ -97,9 +98,9 @@ def main():
     print(libri_tts_df)
 
     # save to csv
-    libri_tts_df.to_csv(os.path.join(output_dir, "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-train-clean-960.csv"), index=False)
-    libri_tts_dev_df.to_csv(os.path.join(output_dir, "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-dev-clean.csv"), index=False)
-    libri_tts_test_df.to_csv(os.path.join(output_dir, "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-test-clean.csv"), index=False)
+    libri_tts_df.to_csv(os.path.join(output_dir, "libri_tts-train-clean-960.csv"), index=False)
+    libri_tts_dev_df.to_csv(os.path.join(output_dir, "libri_tts-dev-clean.csv"), index=False)
+    libri_tts_test_df.to_csv(os.path.join(output_dir, "libri_tts-test-clean.csv"), index=False)
 
 
 if __name__ == "__main__":

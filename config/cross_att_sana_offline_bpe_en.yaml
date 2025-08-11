@@ -1,16 +1,18 @@
-title: DFMTTS-ALC-PTBR-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-Cross-Attention-SANA-Linear-Attention-LibriTTSR-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
+model_type: "dit_crossattn"
 # source_dist_type: "uniform"
 source_dist_type: "mask"
 
 datasets:
     type: "offline"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5/dfm_train_metadata.csv"
-    val_metadata: "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5/dfm_val_metadata.csv"
-    base_dir: "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5_xcodec2"
+    train_metadata: "/raid/aluno_alef/DATASETS/train_dfm_ablation.csv"
+    val_metadata: "/raid/aluno_alef/DATASETS/dev_dfm_ablation.csv"
+    base_dir: ""
+    filepath_column: "codec_filepath"
 
     sampling_rate: 16000
     max_audio_duration: 41
@@ -36,17 +38,18 @@ datasets:
     mask_type: "contiguous"
     audio_pad_type: "variable"
 
-    # ref_drop_prob: 0.3
-    # cond_drop_prob: 0.2
+    ref_drop_prob: 0.3
+    cond_drop_prob: 0.2
 
-    ref_drop_prob: 0.0
-    cond_drop_prob: 0.0
+    # ref_drop_prob: 0.0
+    # cond_drop_prob: 0.0
     assert_drop_prob: true
 
     guidance_scale: 5.0
 
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
+    audio_pad_token: ${datasets.audio_pad_token}
     text_vocab_size: ${datasets.text_vocab_size}
     hidden_size: 768
     cond_dim: 128
@@ -55,8 +58,15 @@ model:
     dropout: 0.1
     add_token: 2
 
+    use_linear_attn: true
+    use_mix_ffn: true
+    qk_norm: true
+    cross_qk_norm: true
+    mlp_ratio: 4
+
+
 train:
-    batch_size: 100
+    batch_size: 16
     shuffle: True
     num_workers: 12
 
@@ -77,15 +87,15 @@ scheduler:
 trainer:
     accelerator: "gpu"
     # max_epochs: 100
-    # max_steps: 500000
-    max_steps: 1000000
+    max_steps: 250000
+    # max_steps: 1000000
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
     val_check_interval: 1.0 # Every 1 epoch
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 8
 
 model_checkpoint:
     mode: "min"
@@ -99,20 +109,20 @@ test:
     log_audio_ref: true
     nsf: 512
     max_audio_length: 1024
-    audio_ref_path: "/raid/aluno_alef/DATASETS/dataset_alc_48k_md5/bbd699/100/a600e123eb.wav"
-    text_ref: "O que ela disse? E como é que ela sabia que nós estávamos lá, afinal?"
+    audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
     sentences:
-        - "Embora estivesse chovendo, eles decidiram passear na floresta."
-        - "Por causa do trânsito intenso, chegamos à reunião um pouco atrasados."
-        - "Se você quer ter sucesso, deve estar preparado para trabalhar muito duro e manter o foco."
-        - "Antes de sair de férias, lembre-se de regar as plantas e trancar todas as portas."
-        - "Depois de terminar o trabalho, ele relaxou ouvindo música clássica e lendo um livro."
+        - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"
+        - "There is no way, however, to eliminate the possibility of the fibers having come from another identical shirt, end quote"
+        - "Oswald's Marine training in marksmanship, his other rifle experience and his established familiarity with this particular weapon"
+        - "Nevertheless, she attempted to commit suicide by driving her nails, purposely left long, into her throat."
+        - "His being was like an all sided lens concentrating all joys in the one heart of his consciousness."
+        - "When he reached Mary's shop, he turned into the court to the kitchen door."
 
 tags:
     - Discrete Flow Matching
     - Xcodec2
-    - PT-BR
-    # - ${trainer.max_epochs}-max_epochs
+    - EN
     - ${trainer.max_steps}-max_steps
     - ${train.batch_size}-BS
     - LR-${optimizer.params.learning_rate}

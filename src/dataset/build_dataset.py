@@ -14,6 +14,12 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
     train_df = pd.read_csv(config.datasets.train_metadata)
     val_df = pd.read_csv(config.datasets.val_metadata)
 
+    # if "language" column is not present, add it with a default value
+    if "language" not in train_df.columns:
+        train_df["language"] = "en"
+    if "language" not in val_df.columns:
+        val_df["language"] = "en"
+
     text_tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
 
     if config.datasets.type == "dynamic":
@@ -40,12 +46,14 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
         train_dataset = OfflineMultipleSpeakerDataset(
             data=train_df,
             base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
             text_tokenizer=text_tokenizer,
         )
 
         val_dataset = OfflineMultipleSpeakerDataset(
             data=val_df,
             base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
             text_tokenizer=text_tokenizer,
         )
     else:

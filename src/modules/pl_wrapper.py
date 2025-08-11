@@ -23,6 +23,7 @@ from xcodec2.modeling_xcodec2 import XCodec2Model
 from torch.distributions.categorical import Categorical
 
 from modules.model import Transformer
+from modules.model_cross_att import CrossTransformer
 from utils.tokenizer import VoiceBpeTokenizer
 from dataset.build_dataset import build_dataset
 from utils.lr_schedulers import CosineWarmupLR, LinearLR
@@ -60,7 +61,12 @@ class DFMTTSWrapper(L.LightningModule):
 
         self.criteria = torch.nn.CrossEntropyLoss(reduction="none")
 
-        self.model = Transformer(**self.config.model)
+        if self.config.model_type.lower() == "dit_adaln":
+            self.model = Transformer(**self.config.model)
+        elif self.config.model_type.lower() == "dit_crossattn":
+            self.model = CrossTransformer(**self.config.model)
+        else:
+            raise ValueError(f"Invalid model type: {self.config.model_type}")
 
         if config.datasets.type == "dynamic":
             self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
@@ -304,7 +310,7 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text = False
 
         # Assert to verify correctness when the conditional drop probability is set to 0
-        if self.config.datasets.assert_drop_prob:
+        if self.config.datasets.assert_drop_prob and self.config.datasets.ref_drop_prob == 0 and self.config.datasets.cond_drop_prob == 0:
             assert drop_text == False and drop_cond == False, "Drop text and cond should be False for training"
 
         logits = self(
@@ -376,8 +382,9 @@ class DFMTTSWrapper(L.LightningModule):
         print(f"Audio reference shape: {audio_ref.shape}")
 
         codes_ref = audio_codec.encode_code(input_waveform=audio_ref).squeeze()
+        codes_ref_size = codes_ref.shape[-1]
 
-        print(f"Codes reference shape: {codes_ref.shape}")
+        print(f"Codes reference shape: {codes_ref_size}")
 
         # pad codes_ref to have the same length as the model's max_length
         if codes_ref.size(0) < self.config.datasets.max_audio_length:
@@ -400,7 +407,7 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"\nGenerating audio for sentence: {sentence}")
             augmented_sentence = text_ref + " " + sentence
             print(f"Augmented sentence: {augmented_sentence}")
-            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en")).to(self.device).unsqueeze(0)
+            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="pt-br")).to(self.device).unsqueeze(0)
             print(f"Text IDs: {text_ids.shape}", torch.min(text_ids), torch.max(text_ids))
             # Initialize xt with mask token (batch size = 1)
             x_t = self.source_distribution.sample((1, max_length), device=self.device)
@@ -409,44 +416,13 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"Initial codes_ref: {codes_ref.shape}, {torch.min(codes_ref)}, {torch.max(codes_ref)}")
             print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
 
-            num_steps = self.config.test.nsf
-            eps = 1e-9
-            t_init = 0.0
-            t_final = 1.0
-            time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=self.device)
-
-            # Run the flow-matching inference loop
-            for i in tqdm(range(num_steps), total=num_steps):
-                t = time_grid[i : i + 1]         # current time, shape [1]
-                h = time_grid[i + 1] - time_grid[i]  # step size (scalar)
-                # Get Conditional Logits
-                logits = self(
-                    x_t=x_t,
-                    text_ids=text_ids,
-                    cond_ids=codes_ref,
-                    time=t,
-                    drop_text=False,
-                    drop_cond=False,
-                )
-                p1 = torch.softmax(logits, dim=-1)
-                one_hot_x_t = torch.nn.functional.one_hot(x_t, num_classes=vocab_size).float()
-                # Compute the velocity update using the denoiser formulation
-                # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
-                u = (p1 - one_hot_x_t) / (1.0 - t.item() + eps)
-                # Euler update: compute new probabilities and sample the updated state
-                new_probs = one_hot_x_t + h * u
-                new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
-                x_t = torch.distributions.Categorical(probs=new_probs).sample()
-            # remove making tokens from the generated sequence
-            x_t = x_t.squeeze(0)
-            print("Shape after squeeze:", x_t.shape)
-            x_t = x_t[x_t != self.config.datasets.audio_mask_token]
-            print("Shape after mask removal:", x_t.shape)
-            # remove padding tokens from the generated sequence
-            x_t = x_t[x_t != self.config.datasets.audio_pad_token]
-            print("Shape after pad removal:", x_t.shape)
-            x_t = x_t.unsqueeze(0).unsqueeze(0)
-            print("Final Shape", x_t.shape)
+            x_t = self.generate_sample(
+                xt=x_t,
+                text_ids=text_ids,
+                codes_ref=codes_ref,
+                nsf=self.config.test.nsf,
+                codes_ref_size=codes_ref_size
+            )
             # Decode the final token sequence into an audio waveform
             if self.config.datasets.type == "dynamic":
                 generated_audio = self.audio_codec.decode_code(x_t)
@@ -461,3 +437,110 @@ class DFMTTSWrapper(L.LightningModule):
             )
         wandb.log(generated_audios)
 
+    def old_generate_sample(self, x_t, text_ids, codes_ref, nsf):
+        num_steps = self.config.test.nsf
+        eps = 1e-9
+        t_init = 0.0
+        t_final = 1.0
+        time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=self.device)
+
+        # Run the flow-matching inference loop
+        for i in tqdm(range(num_steps), total=num_steps):
+            t = time_grid[i : i + 1]         # current time, shape [1]
+            h = time_grid[i + 1] - time_grid[i]  # step size (scalar)
+            # Get Conditional Logits
+            logits = self(
+                x_t=x_t,
+                text_ids=text_ids,
+                cond_ids=codes_ref,
+                time=t,
+                drop_text=False,
+                drop_cond=False,
+            )
+            p1 = torch.softmax(logits, dim=-1)
+            one_hot_x_t = torch.nn.functional.one_hot(x_t, num_classes=vocab_size).float()
+            # Compute the velocity update using the denoiser formulation
+            # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
+            u = (p1 - one_hot_x_t) / (1.0 - t.item() + eps)
+            # Euler update: compute new probabilities and sample the updated state
+            new_probs = one_hot_x_t + h * u
+            new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
+            x_t = torch.distributions.Categorical(probs=new_probs).sample()
+        # remove making tokens from the generated sequence
+        x_t = x_t.squeeze(0)
+        print("Shape after squeeze:", x_t.shape)
+        x_t = x_t[x_t != self.config.datasets.audio_mask_token]
+        print("Shape after mask removal:", x_t.shape)
+        # remove padding tokens from the generated sequence
+        x_t = x_t[x_t != self.config.datasets.audio_pad_token]
+        print("Shape after pad removal:", x_t.shape)
+        x_t = x_t.unsqueeze(0).unsqueeze(0)
+        print("Final Shape", x_t.shape)
+
+    def generate_sample(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+        num_steps = nsf
+        dt = 1.0 / num_steps
+        x1_temp = 1.0
+        guidance_scale = self.config.datasets.guidance_scale
+        # gamma = config.datasets.guidance_scale
+        gamma = 1
+        mask_token_id = self.config.datasets.audio_mask_token
+        S = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        eps = 1e-9
+        noise = 0.1
+
+        mask_one_hot = torch.zeros((S), device=self.device)
+        mask_one_hot[mask_token_id] = 1.0
+
+        # Loop over the time grid
+        for step in tqdm(range(num_steps), total=num_steps):
+            t_val    = step * dt
+            t_tensor = xt.new_full((1,), t_val)
+
+            # unconditional pass
+            logits_u = self(xt, text_ids, codes_ref, t_tensor, True,  True)
+            probs_u  = torch.softmax(logits_u / x1_temp, -1)
+
+            # conditional pass
+            logits_c = self(xt, text_ids, codes_ref, t_tensor, False, False)
+            probs_c  = torch.softmax(logits_c / x1_temp, -1)
+
+            xt_mask  = (xt == mask_token_id).unsqueeze(-1).float()
+            base_r   = (1 + noise * t_val) / (1 - t_val)
+
+            R_u = xt_mask * probs_u * base_r
+            R_c = xt_mask * probs_c * base_r
+
+            remask = (1 - xt_mask) * mask_one_hot.view(1,1,S) * noise
+            R_u += remask;  R_c += remask
+
+            log_Ru = torch.log(R_u + eps)
+            log_Rc = torch.log(R_c + eps)
+            R_mix  = torch.exp(gamma * log_Rc + (1 - gamma) * log_Ru)
+
+            # enforce row‑sum zero
+            R_mix.scatter_(-1, xt[..., None], 0.)
+            R_mix.scatter_(-1, xt[..., None], -R_mix.sum(-1, keepdim=True))
+
+            # Euler step
+            P = (R_mix * dt).clamp_min(0.)
+            diag = (1. - P.sum(-1, keepdim=True)).clamp_min(0.)
+            P.scatter_(-1, xt[..., None], diag)
+
+            xt = torch.multinomial(P.view(-1, S), 1).view_as(xt)
+
+        print("Final xt shape:", xt.shape)
+        xt = xt[:, codes_ref_size: ]
+        print("Shape after removing codes_ref:", xt.shape)
+        # remove making tokens from the generated sequence
+        xt = xt.squeeze(0)
+        print("Shape after squeeze:", xt.shape)
+        xt = xt[xt != self.config.datasets.audio_mask_token]
+        print("Shape after mask removal:", xt.shape)
+        # remove padding tokens from the generated sequence
+        xt = xt[xt != self.config.datasets.audio_pad_token]
+        print("Shape after pad removal:", xt.shape)
+        xt = xt.unsqueeze(0).unsqueeze(0)
+        print("Final Shape", xt.shape)
+
+        return xt

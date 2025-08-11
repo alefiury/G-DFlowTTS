@@ -71,13 +71,14 @@ class DynamicSingleSpeakerDataset(torch.utils.data.Dataset):
         datum = self.data.iloc[index]
         transcription = datum["transcription"]
         filename = datum["filename"]
+        language = datum["language"]
 
         audio, sr = self._load_audio(filename)
         audio = self._crop_audio(audio)
 
         tokenized_transcription = self.text_tokenizer.encode(
             transcription,
-            lang="en"
+            lang=language
         )
 
         audio_pad = F.pad(audio, (160, 160))
@@ -127,6 +128,7 @@ class OfflineMultipleSpeakerDataset(torch.utils.data.Dataset):
         self,
         data: pd.DataFrame,
         base_dir: str,
+        filepath_column: str,
         text_tokenizer: VoiceBpeTokenizer,
     ):
         """
@@ -136,12 +138,16 @@ class OfflineMultipleSpeakerDataset(torch.utils.data.Dataset):
         """
         self.data = data
         self.base_dir = base_dir
+        self.filepath_column = filepath_column
         self.text_tokenizer = text_tokenizer
 
     def __len__(self):
         return len(self.data)
 
     def _load_codes(self, filename):
+        # treat the case that filename starts with "/"
+        if filename.startswith("/") and self.base_dir != "":
+            filename = filename[1:]
         codes_path = os.path.join(self.base_dir, filename)
 
         if codes_path.endswith(".wav"):
@@ -156,7 +162,7 @@ class OfflineMultipleSpeakerDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         datum = self.data.iloc[index]
         transcription = datum["text"]
-        filename = datum["filename"]
+        filename = datum[self.filepath_column]
         language = datum["language"]
         try:
             audio_codes = self._load_codes(filename)
@@ -340,29 +346,200 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         return audio_codes_padded, transcription_padded, masked_audio_codes, mask
 
 
+class DurationBPEOfflineDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        base_dir: str,
+        filepath_column: str,
+        text_tokenizer: VoiceBpeTokenizer,
+    ):
+        """
+        data: A list of data entries, each containing 'audio', 'transcription', 'speaker', etc.
+        tokenizer: A tokenizer used to convert text into tokens.
+        max_audio_duration: Maximum audio duration in seconds (default: 41 seconds).
+        """
+        self.data = data
+        self.base_dir = base_dir
+        self.filepath_column = filepath_column
+        self.text_tokenizer = text_tokenizer
+
+    def __len__(self):
+        return len(self.data)
+
+    def _load_codes(self, filename):
+        # treat the case that filename starts with "/"
+        if filename.startswith("/") and self.base_dir != "":
+            filename = filename[1:]
+        codes_path = os.path.join(self.base_dir, filename)
+
+        # if codes_path.endswith(".wav"):
+        #     codes_path = codes_path[:-4] + ".pt"
+
+        codes = torch.load(codes_path)
+
+        # remove all empty dimensions
+        codes = codes.squeeze()
+        return codes
+
+    def __getitem__(self, index):
+        datum = self.data.iloc[index]
+        transcription = datum["text"]
+
+        if not isinstance(transcription, str):
+            transcription = str(transcription)
+
+        filename = datum[self.filepath_column]
+
+        if "language" in datum:
+            language = datum["language"]
+        else:
+            language = "en"
+        # try:
+        audio_codes = self._load_codes(filename)
+        tokenized_transcription = torch.tensor(
+            self.text_tokenizer.encode(
+                transcription,
+                lang=language
+            )
+        )
+        duration = audio_codes.shape[-1]
+        # except Exception as e:
+        #     print(f"Error loading {filename}: {e}")
+        #     next_idx = random.randint(index+1, len(self.data)-1)
+        #     return self.__getitem__(next_idx)
+        return audio_codes, duration, tokenized_transcription
+
+
+class DurationBPEOfflineCollateFunc:
+    def __init__(
+        self,
+        audio_pad_token: int = 0,
+        audio_bos_token: int = 1,
+        text_pad_token: int = 0,
+        max_audio_length: Optional[int] = 2048,
+    ):
+        self.audio_pad_token = audio_pad_token
+        self.audio_bos_token = audio_bos_token
+        self.text_pad_token = text_pad_token
+        self.max_audio_length = max_audio_length
+
+    def __call__(self, batch: List[str]):
+        audio_codes, durations, tokenized_transcription_list = zip(*batch)
+        B = len(audio_codes)
+
+        processed_audio  = []   # new code sequences with BOS
+        dur_list         = []   # durations including BOS
+        for codes, dur in zip(audio_codes, durations):
+            bos_vec = codes.new_full((1,), self.audio_bos_token)
+            codes_bos = torch.cat((bos_vec, codes), dim=0)   # [C, dur+1]
+            processed_audio.append(codes_bos)
+            dur_list.append(dur + 1)
+
+        Tmax = min(
+            max(a.shape[-1] for a in processed_audio),
+            self.max_audio_length - 1  # -1 for BOS token
+        )
+
+        audio_padded = torch.full(
+            (B, Tmax),
+            fill_value=self.audio_pad_token,
+            dtype=processed_audio[0].dtype
+        )
+        audio_mask = torch.zeros((B, Tmax), dtype=torch.bool)
+
+        for i, (codes, T) in enumerate(zip(processed_audio, dur_list)):
+            T = min(T, Tmax)
+            audio_padded[i, :T] = codes[:T]
+            audio_mask[i, :T] = 1
+
+        # Text padding
+        text_padded = pad_sequence(
+            tokenized_transcription_list,
+            batch_first=True,
+            padding_value=self.text_pad_token
+        )
+        text_mask = (text_padded != self.text_pad_token)
+
+        remaining_len_pad = torch.zeros((B, Tmax), dtype=torch.long)
+        for i, T in enumerate(dur_list):
+            T = min(T, Tmax)
+            remaining_len_pad[i, :T] = torch.arange(
+                T,
+                0,
+                step=-1,
+                dtype=torch.long
+            )
+
+        return (
+            audio_padded, # [B, Tmax]
+            audio_mask, # [B, Tmax]
+            torch.tensor(dur_list, dtype=torch.long), # [B]
+            text_padded, # [B, Lmax]
+            text_mask, # [B, Lmax]
+            remaining_len_pad # [B, Tmax]
+        )
+
+
 @torch.no_grad()
 def main():
-    metadata_path = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-train-clean-460.csv"
+    # metadata_path = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-train-clean-460.csv"
+    # data = pd.read_csv(metadata_path)
+
+    # text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
+
+    # dataset = OfflineMultipleSpeakerDataset(
+    #     data=data,
+    #     base_dir="/hadatasets/alef.ferreira/DATASETS/LibriTTS_R_xcodec2",
+    #     text_tokenizer=text_tokenizer
+    # )
+
+    # collate_fn = OfflineMultipleSpeakerMaskCollateFunc(
+    #     max_audio_length=2048,
+    #     mask_prob=(0.7, 1.0),
+    #     audio_mask_token=65536,
+    #     audio_pad_token=65537,
+    #     text_pad_token=0,
+    #     mask_type="contiguous",
+    #     # mask_type="random",
+    #     audio_pad_type="variable", # can be "variable" or "fixed"
+    #     # audio_pad_type="fixed", # can be "variable" or "fixed"
+    # )
+
+    # dataloader = torch.utils.data.DataLoader(
+    #     dataset,
+    #     batch_size=4,
+    #     shuffle=True,
+    #     num_workers=8,
+    #     collate_fn=collate_fn
+    # )
+
+    # for x_1, transcription_ids, cond in dataloader:
+    #     print(x_1.shape)
+    #     print(transcription_ids.shape)
+    #     print(cond.shape)
+
+    #     print(x_1)
+    #     print(cond)
+    #     print(transcription_ids)
+    #     break
+
+    metadata_path = "/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R/libri_tts-train-clean-960.csv"
     data = pd.read_csv(metadata_path)
 
     text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
 
-    dataset = OfflineMultipleSpeakerDataset(
+    dataset = DurationBPEOfflineDataset(
         data=data,
-        base_dir="/hadatasets/alef.ferreira/DATASETS/LibriTTS_R_xcodec2",
+        base_dir="/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R",
         text_tokenizer=text_tokenizer
     )
 
-    collate_fn = OfflineMultipleSpeakerMaskCollateFunc(
+    collate_fn = DurationBPEOfflineCollateFunc(
         max_audio_length=2048,
-        mask_prob=(0.7, 1.0),
-        audio_mask_token=65536,
-        audio_pad_token=65537,
         text_pad_token=0,
-        mask_type="contiguous",
-        # mask_type="random",
-        audio_pad_type="variable", # can be "variable" or "fixed"
-        # audio_pad_type="fixed", # can be "variable" or "fixed"
+        audio_pad_token=65537,
+        audio_bos_token=65536,  # BOS token for audio
     )
 
     dataloader = torch.utils.data.DataLoader(
@@ -373,14 +550,8 @@ def main():
         collate_fn=collate_fn
     )
 
-    for x_1, transcription_ids, cond in dataloader:
-        print(x_1.shape)
-        print(transcription_ids.shape)
-        print(cond.shape)
-
-        print(x_1)
-        print(cond)
-        print(transcription_ids)
+    for batch in dataloader:
+        print(batch)
         break
 
 

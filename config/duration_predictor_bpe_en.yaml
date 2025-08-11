@@ -1,0 +1,86 @@
+title: Duration-Predictor-(Steps-${trainer.max_epochs})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+wandb_project_name: "Duration-Predictor-DFM-TTS"
+wandb_entity: "alefiury"
+
+datasets:
+    type: "offline"
+
+    train_metadata: "/raid/aluno_alef/DATASETS/train_duration.csv"
+    val_metadata: "/raid/aluno_alef/DATASETS/dev_duration.csv"
+    filepath_column: "codec_filepath"
+    base_dir: ""
+
+    sampling_rate: 16000
+    max_audio_duration: 41
+
+    vocab_file: "/raid/aluno_alef/DFM-TTS-2/config/vocab.json"
+    audio_codec: "HKUSTAudio/xcodec2"
+    speech_processor: "facebook/w2v-bert-2.0"
+    max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
+
+    text_vocab_size: 6681
+    audio_vocab_size: 65536
+
+    text_pad_token: 0
+
+    audio_bos_token: 65536
+    audio_pad_token: 65537
+
+model:
+    audio_vocab_size: ${datasets.audio_vocab_size}
+    text_vocab_size: ${datasets.text_vocab_size}
+    hidden_size: 512
+    n_text_layer: 4
+    n_cross_layer: 4
+    n_head: 8
+    output_dim: ${datasets.max_audio_length}
+    audio_add_tokens: 2
+
+train:
+    batch_size: 128
+    shuffle: True
+    num_workers: 12
+
+optimizer:
+    name: "adamw"
+    params:
+        min_learning_rate: 1e-4
+        learning_rate: 3e-4
+        eps: 1e-8
+        weight_decay: 1e-4
+        betas: [0.9, 0.999]
+
+scheduler:
+    name: "CosineWarmupLR"
+    params:
+        warmup_lr: 5000
+
+trainer:
+    accelerator: "gpu"
+    max_epochs: 100
+    # max_steps: 500000
+    # max_steps: 1000000
+    num_sanity_val_steps: 2
+    overfit_batches: 0.0
+    log_every_n_steps: 10
+    gradient_clip_val: 10.0
+    gradient_clip_algorithm: "norm"
+    val_check_interval: 1.0 # Every 1 epoch
+    accumulate_grad_batches: 2
+    # precision: "bf16"
+
+model_checkpoint:
+    mode: "min"
+    save_last: true
+    save_weights_only: false
+    monitor: "val/loss_epoch"
+    dirpath: "/raid/aluno_alef/DFM-TTS-2/checkpoints/Duration-Predictor"
+    filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
+
+tags:
+    - Duration-Predictor
+    - Xcodec2
+    - EN
+    - ${trainer.max_epochs}-max_epochs
+    - ${train.batch_size}-BS
+    - LR-${optimizer.params.learning_rate}

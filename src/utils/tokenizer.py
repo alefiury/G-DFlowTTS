@@ -618,7 +618,7 @@ class VoiceBpeTokenizer:
             "fr": 512,
             "es": 512,
             "it": 512,
-            "pt": 512,
+            "pt": 1024,
             "pl": 512,
             "zh": 512,
             "ar": 512,

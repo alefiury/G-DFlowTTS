@@ -1,17 +1,15 @@
 import os
+from tqdm import tqdm
 from glob import glob
 
+import wandb
 import torch
-from tqdm import tqdm
 import torchaudio
 import pandas as pd
-
-from joblib import Parallel, delayed, parallel_backend
 from tqdm_joblib import tqdm_joblib
+from joblib import Parallel, delayed, parallel_backend
 
 from xcodec2.modeling_xcodec2 import XCodec2Model
-
-import wandb
 
 
 def libri_tts(root_path, meta_files=None, ignored_speakers=None):
@@ -52,18 +50,19 @@ def libri_tts(root_path, meta_files=None, ignored_speakers=None):
     print(f"Number of items (after file check): {len(new_items)}")
     return new_items
 
-wandb.login()
+
+# wandb.login()
 def main():
-    n_jobs = -1
+    n_jobs = 12
     target_sr = 16000
     model_path = "HKUSTAudio/xcodec2"
-    output_dir = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R_xcodec2"
-    libritts_r_base_dir = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/train-other-500/"
+    output_dir = "/raid/aluno_alef/DATASETS/LibriTTS_R/LibriTTS_R-xcodec2"
+    libritts_r_base_dir = "/raid/aluno_alef/DATASETS/LibriTTS_R/"
 
-    wandb.init(project="Preprocess", entity="alefiury")
+    # wandb.init(project="Preprocess", entity="alefiury")
 
-    wandb.run.name = "xcodec2_codes"
-    wandb.run.save()
+    # wandb.run.name = "xcodec2_codes"
+    # wandb.run.save()
 
     # Get metadata for all audio files
     meta_items = libri_tts(libritts_r_base_dir)
@@ -99,8 +98,10 @@ def main():
             wav = torchaudio.transforms.Resample(sr, target_sr)(wav)
         with torch.no_grad():
             vq_code = model.encode_code(input_waveform=wav)
-        os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-        torch.save(vq_code.cpu(), output_filepath)
+
+        print(vq_code.shape)
+        # os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
+        # torch.save(vq_code.cpu(), output_filepath)
 
     # Process the DataFrame rows in parallel with a progress bar.
     with parallel_backend("threading", n_jobs=n_jobs):

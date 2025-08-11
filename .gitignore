@@ -6,10 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+vocab.json
 wandb/
 samples/
 DFM-TTS/
+Duration-Predictor-DFM-TTS/
 outputs*/
+outputs_pfg/
 checkpoints/
 *.wav
 *.ckpt
