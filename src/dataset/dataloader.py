@@ -176,6 +176,7 @@ class OfflineMultipleSpeakerDataset(torch.utils.data.Dataset):
             print(f"Error loading {filename}: {e}")
             next_idx = random.randint(index+1, len(self.data)-1)
             return self.__getitem__(next_idx)
+
         return audio_codes, tokenized_transcription
 
 
@@ -223,18 +224,35 @@ class OfflineMultipleSpeakerUniformCollateFunc:
 class OfflineMultipleSpeakerMaskCollateFunc:
     def __init__(
         self,
-        max_audio_length: int = 2048,
-        mask_prob: Tuple[float] = (0.7, 1.0),
-        audio_mask_token: int = 0,
-        audio_pad_token: int = 0,
-        text_pad_token: int = 0,
-        mask_type: str = "contiguous",
-        audio_pad_type: str = "variable", # can be "variable" or "fixed"
+        max_audio_length: int,
+        mask_prob: Tuple[float],
+        audio_mask_token: int,
+        audio_pad_token: int,
+        audio_eos_token: int,
+        text_pad_token: int,
+        mask_type: str,
+        audio_pad_type: str,
     ):
+        """
+        Initializes the collate function for masking audio features.
+
+        Params:
+            max_audio_length (int): The maximum length of the audio sequences.
+            mask_prob (Tuple[float]): The probability range for masking audio tokens, (min, max).
+            audio_mask_token (int): The token ID used for masking audio tokens.
+            audio_pad_token (int): The token ID used for padding audio tokens.
+            audio_eos_token (int): The token ID used for the end of audio sequences.
+            text_pad_token (int): The token ID used for padding text tokens.
+            mask_type (str): The type of masking to apply ("random" or "contiguous").
+            audio_pad_type (str): The padding type for audio sequences ("variable" or "fixed").
+        """
         self.max_audio_length = max_audio_length
         self.mask_prob = mask_prob
+
         self.audio_mask_token = audio_mask_token
         self.audio_pad_token = audio_pad_token
+        self.audio_eos_token = audio_eos_token
+
         self.text_pad_token = text_pad_token
 
         self.mask_type = mask_type
@@ -247,42 +265,44 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         """
         Applies masking to the audio codes and creates a loss mask.
 
-        The masked audio codes replace tokens (except padding tokens) with mask_token
-        according to the specified strategy. The loss mask indicates which tokens were masked
-        (and are not padding) and therefore will be used for the loss calculation.
-
         Returns:
             masked_audio (Tensor): The audio codes after applying masking.
             loss_mask (Tensor): A boolean tensor with True for tokens to use in the loss.
         """
-        # Sample mask_prob from a uniform distribution
-        mask_prob = torch.rand(1).float().uniform_(*self.mask_prob).item()
+        B, L = audio_codes_padded.shape
+
+        # Sample one masking probability per sequence (on the right device)
+        # Each p_i ~ Uniform(self.mask_prob[0], self.mask_prob[1])
+        p_seq = torch.empty(B, device=audio_codes_padded.device, dtype=torch.float32)
+        p_seq.uniform_(self.mask_prob[0], self.mask_prob[1])  # shape: (B,)
 
         if self.mask_type == "random":
-            # Only valid (non-padding) tokens are candidates.
-            valid = (audio_codes_padded != self.audio_pad_token)
-            rand = torch.rand(audio_codes_padded.shape, device=audio_codes_padded.device)
-            mask = (rand < mask_prob) & valid
+            valid = (audio_codes_padded != self.audio_pad_token)              # (B, L) bool
+            rand = torch.rand(B, L, device=audio_codes_padded.device)         # (B, L) float
+            # Broadcast p_seq to (B, L) and compare
+            mask = (rand < p_seq[:, None]) & valid                             # (B, L) bool
+
             masked_audio = audio_codes_padded.clone()
             masked_audio[mask] = self.audio_mask_token
+
         elif self.mask_type == "contiguous":
             masked_audio = audio_codes_padded.clone()
-            B, L = audio_codes_padded.shape
             mask = torch.zeros_like(audio_codes_padded, dtype=torch.bool)
             for i in range(B):
                 valid_idx = (audio_codes_padded[i] != self.audio_pad_token).nonzero(as_tuple=False).squeeze()
                 if valid_idx.numel() > 0:
                     valid_length = valid_idx.numel()
-                    block_length = max(1, int(valid_length * mask_prob))
+                    # Use the per-sequence probability to set the block length
+                    block_length = max(1, int(valid_length * float(p_seq[i].item())))
+                    start_idx = 0
                     if valid_length - block_length > 0:
-                        start_idx = torch.randint(0, valid_length - block_length + 1, (1,)).item()
-                    else:
-                        start_idx = 0
-                    indices_to_mask = valid_idx[start_idx:start_idx+block_length]
+                        start_idx = torch.randint(0, valid_length - block_length + 1, (1,), device=audio_codes_padded.device).item()
+                    indices_to_mask = valid_idx[start_idx:start_idx + block_length]
                     mask[i, indices_to_mask] = True
                     masked_audio[i, indices_to_mask] = self.audio_mask_token
         else:
             raise ValueError(f"Unknown mask_type: {self.mask_type}")
+
         return masked_audio, mask
 
     def pad_audio_codec(self, feature: torch.Tensor, max_length: int, padding_value: int = 0) -> torch.Tensor:
@@ -308,23 +328,31 @@ class OfflineMultipleSpeakerMaskCollateFunc:
     def __call__(self, batch: List[str]):
         audio_codes, tokenized_transcription_list = zip(*batch)
 
-        # Variable length padding
+        # Choose target length (include +1 for EOS)
         if self.audio_pad_type == "variable":
-            max_audio_length = max([audio.shape[-1] for audio in audio_codes])
+            max_audio_length = max([audio.shape[-1] + 1 for audio in audio_codes])  # +1 for EOS
             if max_audio_length > self.max_audio_length:
                 max_audio_length = self.max_audio_length
-        # Fixed length padding
         elif self.audio_pad_type == "fixed":
             max_audio_length = self.max_audio_length
         else:
             raise ValueError(f"Unknown audio_pad_type: {self.audio_pad_type}")
 
-        # Audio Padding
+        # Audio: append EOS, then pad/truncate
         padded_audio_list = []
         for audio in audio_codes:
             if audio.ndim == 1:
                 audio = audio.unsqueeze(0)
-            # pad the sample (assuming shape (1, L) or (L, D) if already multi-dimensional).
+            if audio.size(1) >= max_audio_length:
+                audio = audio[:, :max_audio_length - 1]
+            eos_col = torch.full(
+                (audio.size(0), 1),
+                self.audio_eos_token,
+                dtype=audio.dtype,
+                device=audio.device,
+            )
+            audio = torch.cat([audio, eos_col], dim=1)
+
             padded_audio = self.pad_audio_codec(
                 audio,
                 max_audio_length,
@@ -335,15 +363,20 @@ class OfflineMultipleSpeakerMaskCollateFunc:
             padded_audio_list.append(padded_audio)
 
         audio_codes_padded = torch.stack(padded_audio_list, dim=0)
+
+        # Masking
         masked_audio_codes, mask = self.mask_audio_and_create_loss_mask(audio_codes_padded)
-        # Text padding
+
+        # Text padding + attention mask
         transcription_padded = pad_sequence(
             tokenized_transcription_list,
             batch_first=True,
             padding_value=self.text_pad_token
         )
+        transcription_attention_mask = (transcription_padded != self.text_pad_token)  # bool mask
 
-        return audio_codes_padded, transcription_padded, masked_audio_codes, mask
+        # return order: keep audio + text grouped; add attention mask right after text
+        return audio_codes_padded, transcription_padded, transcription_attention_mask, masked_audio_codes, mask
 
 
 class DurationBPEOfflineDataset(torch.utils.data.Dataset):
@@ -481,18 +514,283 @@ class DurationBPEOfflineCollateFunc:
         )
 
 
+class OfflineMultipleSpeakerDreamOnCollateFunc:
+    def __init__(
+        self,
+        max_audio_length: int = 2048,
+        audio_mask_token: int = 65536,
+        audio_pad_token: int = 65537,
+        audio_expand_token: int = 65538,
+        audio_eos_token: int = 65539,          # <-- EOS replaces DELETE
+        text_pad_token: int = 0,
+        mask_type: str = "contiguous",
+        mask_prob: Tuple[float, float] = (0.7, 1.0),
+        audio_pad_type: str = "variable",      # "variable" or "fixed"
+        # DreamOn-ish knobs:
+        mix_ratio: float = 0.5,
+        p_merge_static: float = 0.25,
+        p_merge_dynamic_scale: float = 0.5,
+        delete_frac_range: tuple = (0.0, 0.10),  # how many EOS-in-middle to insert (fraction of current length)
+        delete_loss_weight: float = 0.5,
+    ):
+        self.max_audio_length = max_audio_length
+        self.audio_mask_token = audio_mask_token
+        self.audio_pad_token = audio_pad_token
+        self.audio_expand_token = audio_expand_token
+        self.audio_eos_token = audio_eos_token
+        self.text_pad_token = text_pad_token
+        self.mask_type = mask_type
+        self.mask_prob = mask_prob
+        self.audio_pad_type = audio_pad_type
+
+        self.mix_ratio = mix_ratio
+        self.p_merge_static = p_merge_static
+        self.p_merge_dynamic_scale = p_merge_dynamic_scale
+        self.delete_frac_range = delete_frac_range
+        self.delete_loss_weight = delete_loss_weight
+
+    # ---------- utilities ----------
+    def _pad_1d(self, x: torch.Tensor, L: int, value: int) -> torch.Tensor:
+        out = x.new_full((L,), value)
+        Lx = min(L, x.numel())
+        out[:Lx] = x[:Lx]
+        return out
+
+    def _append_eos_then_pad(self, x: torch.Tensor, L: int) -> torch.Tensor:
+        """Make room for EOS if needed, append EOS, then pad with PAD to L."""
+        x = x.view(-1).long()
+        if L <= 0:
+            return x.new_zeros((0,), dtype=torch.long)
+        # leave room for EOS if we must truncate
+        core_max = max(0, L - 1)
+        x = x[:core_max]
+        x = torch.cat([x, x.new_tensor([self.audio_eos_token])], dim=0)
+        if x.numel() < L:
+            x = torch.cat([x, x.new_full((L - x.numel(),), self.audio_pad_token)], dim=0)
+        return x
+
+    def _find_spans(self, mask_bool: torch.Tensor):
+        spans = []
+        if mask_bool.numel() == 0:
+            return spans
+        in_run = False
+        start = 0
+        for i, v in enumerate(mask_bool.tolist() + [False]):
+            if v and not in_run:
+                in_run = True
+                start = i
+            elif not v and in_run:
+                in_run = False
+                spans.append((start, i))  # [start, end)
+        return spans
+
+    def _mask_audio_random_or_contiguous(self, audio: torch.Tensor):
+        """
+        Per-sequence masking (each sequence samples its own p in [min,max]).
+        Returns a boolean mask of which positions are masked.
+        """
+        L = audio.numel()
+        mask_bool = torch.zeros(L, dtype=torch.bool, device=audio.device)
+
+        p_min, p_max = self.mask_prob
+        p = torch.empty(1, device=audio.device).uniform_(p_min, p_max).item()
+
+        if self.mask_type == "contiguous":
+            valid = (audio != self.audio_pad_token).nonzero(as_tuple=False).squeeze(-1)
+            if valid.numel() > 0:
+                valid_L = valid.numel()
+                block_len = max(1, int(valid_L * p))
+                start = torch.randint(0, max(1, valid_L - block_len + 1), (1,), device=audio.device).item()
+                idx = valid[start : start + block_len]
+                mask_bool[idx] = True
+        else:
+            valid = (audio != self.audio_pad_token)
+            rand = torch.rand_like(audio, dtype=torch.float)
+            mask_bool = (rand < p) & valid
+
+        return mask_bool
+
+    def _merge_masks_into_expand(self, src_tokens: list, mask_bool: torch.Tensor):
+        """
+        Pairwise merge masked tokens to <EXPAND> with probability p.
+        Leftover singles remain masked (to be masked in input).
+        """
+        spans = self._find_spans(mask_bool)
+        num_mask = int(mask_bool.sum().item())
+        p_dyn = 0.0 if num_mask == 0 else min(1.0, self.p_merge_dynamic_scale / float(num_mask))
+        p = self.mix_ratio * self.p_merge_static + (1.0 - self.mix_ratio) * p_dyn
+
+        out_tokens, out_mask = [], []
+        i = 0
+        for (s, e) in spans:
+            # copy region before span
+            while i < s:
+                out_tokens.append(src_tokens[i]); out_mask.append(False); i += 1
+            # inside span
+            span_len = e - s
+            j = 0
+            while j < span_len:
+                if (j + 1) < span_len and torch.rand(1).item() < p:
+                    out_tokens.append(self.audio_expand_token)
+                    out_mask.append(True)   # EXPAND is supervised (masked in input)
+                    j += 2
+                else:
+                    out_tokens.append(src_tokens[s + j])
+                    out_mask.append(True)   # still masked
+                    j += 1
+            i = e
+        # tail
+        while i < len(src_tokens):
+            out_tokens.append(src_tokens[i]); out_mask.append(False); i += 1
+        return out_tokens, out_mask
+
+    def _insert_middle_eos(self, z0_tokens: list, z0_mask: list):
+        """
+        Insert EOS *inside* the editable region (not the terminal EOS),
+        to teach delete semantics via EOS-in-the-middle. The inserted EOS positions
+        are supervised (masked in input). Count ~ Uniform(delete_frac_range) * L.
+        """
+        L = len(z0_tokens)
+        if L == 0:
+            return z0_tokens, z0_mask
+
+        lo, hi = self.delete_frac_range
+        k = int(torch.empty(1).uniform_(lo, hi).item() * L)
+        if k <= 0:
+            return z0_tokens, z0_mask
+
+        # avoid placing EOS right after sentinels or on PAD/MASK/EXPAND/EOS
+        SENTINELS = {
+            self.audio_pad_token,
+            self.audio_mask_token,
+            self.audio_expand_token,
+            self.audio_eos_token,  # don’t chain EOS
+        }
+
+        eligible = []
+        for t in range(1, L - 1):  # keep last EOS (appended) intact; need a left neighbor
+            left = z0_tokens[t - 1]
+            cur  = z0_tokens[t]
+            if left not in SENTINELS and cur not in SENTINELS:
+                eligible.append(t)
+
+        if len(eligible) == 0:
+            return z0_tokens, z0_mask
+
+        k = min(k, len(eligible))
+        chosen = sorted(torch.randperm(len(eligible))[:k].tolist())
+        ins_positions = [eligible[idx] for idx in chosen]
+
+        out_t, out_m = [], []
+        src_i = 0
+        ins_i = 0
+        for t in range(L + k):
+            # We compare against src index + how many we've already inserted before it
+            if ins_i < k and (src_i + ins_i) == ins_positions[ins_i]:
+                out_t.append(self.audio_eos_token)  # middle EOS (delete signal)
+                out_m.append(True)                  # supervised → masked in input
+                ins_i += 1
+            else:
+                out_t.append(z0_tokens[src_i])
+                out_m.append(z0_mask[src_i])
+                src_i += 1
+
+        return out_t, out_m
+
+    def _build_input_from_z0(self, z0_tokens: list, z0_mask: list):
+        """
+        Build model input by masking only the supervised positions and EXPAND sentinels.
+        - Terminal EOS has z0_mask=False → stays visible.
+        - Middle EOS has z0_mask=True   → becomes MASK (supervised).
+        """
+        inp = []
+        loss_mask = []
+        for tok, m in zip(z0_tokens, z0_mask):
+            is_expand = (tok == self.audio_expand_token)
+            use_mask = m or is_expand
+            inp.append(self.audio_mask_token if use_mask else tok)
+            loss_mask.append(bool(use_mask))
+        return inp, torch.tensor(loss_mask, dtype=torch.bool)
+
+    def __call__(self, batch):
+        # unpack
+        audio_codes, tokenized_transcription_list = zip(*batch)
+
+        # choose target length (include room for EOS)
+        if self.audio_pad_type == "variable":
+            # +1 for EOS on each sequence, then cap by max_audio_length
+            lengths_plus_eos = [int(a.view(-1).numel()) + 1 for a in audio_codes]
+            max_L = min(max(lengths_plus_eos), self.max_audio_length)
+        elif self.audio_pad_type == "fixed":
+            max_L = self.max_audio_length
+        else:
+            raise ValueError(f"Unknown audio_pad_type: {self.audio_pad_type}")
+
+        z0_list, inp_list, m_list = [], [], []
+        for audio in audio_codes:
+            a = audio.clone().long().view(-1)
+
+            # (0) append EOS then PAD to max_L
+            a = self._append_eos_then_pad(a, max_L)              # shape [max_L]
+
+            # (1) pick mask set (per-sequence probability)
+            mask_bool = self._mask_audio_random_or_contiguous(a)
+
+            # (2) z0: start from original tokens (a), merge masked spans -> <EXPAND>
+            z0_tokens, z0_mask = self._merge_masks_into_expand(a.tolist(), mask_bool)
+
+            # (3) insert EOS *in the middle* as delete signals (supervised)
+            z0_tokens, z0_mask = self._insert_middle_eos(z0_tokens, z0_mask)
+
+            # (4) input to model & loss mask
+            inp_tokens, loss_mask = self._build_input_from_z0(z0_tokens, z0_mask)
+
+            # (5) truncate (safety) to max_L and pad together
+            Lcap = min(max_L, len(z0_tokens))
+            z0_tokens  = z0_tokens[:Lcap]
+            inp_tokens = inp_tokens[:Lcap]
+            loss_mask  = loss_mask[:Lcap]
+
+            z0_list.append(self._pad_1d(torch.as_tensor(z0_tokens, dtype=torch.long, device=a.device), max_L, self.audio_pad_token))
+            inp_list.append(self._pad_1d(torch.as_tensor(inp_tokens, dtype=torch.long, device=a.device), max_L, self.audio_pad_token))
+            m_list.append(self._pad_1d(loss_mask.to(torch.long), max_L, 0).bool())
+
+        z0_padded    = torch.stack(z0_list, dim=0)
+        input_padded = torch.stack(inp_list, dim=0)
+        loss_mask    = torch.stack(m_list,  dim=0)
+
+        # --- Text padding + attention mask ---
+        transcription_padded = pad_sequence(
+            tokenized_transcription_list,
+            batch_first=True,
+            padding_value=self.text_pad_token
+        )
+        transcription_attention_mask = (transcription_padded != self.text_pad_token)  # bool
+
+        # RETURN ORDER (now includes text attn mask):
+        # x_1=z0_padded, text, text_attn_mask, cond=input_padded, loss_mask
+        return z0_padded, transcription_padded, transcription_attention_mask, input_padded, loss_mask
+
+
 @torch.no_grad()
 def main():
-    # metadata_path = "/hadatasets/alef.ferreira/DATASETS/LibriTTS_R/libri_tts-train-clean-460.csv"
-    # data = pd.read_csv(metadata_path)
+    metadata_path = "/raid/aluno_alef/DATASETS/train_dfm_ablation.csv"
+    data = pd.read_csv(metadata_path)
 
-    # text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
+    if "language" not in data.columns:
+        data["language"] = "en"
 
-    # dataset = OfflineMultipleSpeakerDataset(
-    #     data=data,
-    #     base_dir="/hadatasets/alef.ferreira/DATASETS/LibriTTS_R_xcodec2",
-    #     text_tokenizer=text_tokenizer
-    # )
+    text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
+
+    print(text_tokenizer.tokenizer)
+    print(text_tokenizer.tokenizer.get_vocab()["[START]"])
+
+    dataset = OfflineMultipleSpeakerDataset(
+        data=data,
+        base_dir="",
+        filepath_column="codec_filepath",
+        text_tokenizer=text_tokenizer
+    )
 
     # collate_fn = OfflineMultipleSpeakerMaskCollateFunc(
     #     max_audio_length=2048,
@@ -506,6 +804,65 @@ def main():
     #     # audio_pad_type="fixed", # can be "variable" or "fixed"
     # )
 
+    collate_fn = OfflineMultipleSpeakerDreamOnCollateFunc(
+        max_audio_length=2048,
+        mask_prob=(0.7, 1.0),
+        audio_mask_token=65536,
+        audio_pad_token=65537,
+        text_pad_token=0,
+        # mask_type="contiguous",
+        mask_type="random",
+        audio_pad_type="variable", # can be "variable" or "fixed"
+        # audio_pad_type="fixed", # can be "variable" or "fixed"
+        audio_expand_token=65538,
+        audio_delete_token=65539,
+        mix_ratio=0.5,
+        p_merge_static=0.25,
+        p_merge_dynamic_scale=0.5,
+        delete_frac_range=(0.0, 0.10),
+        delete_loss_weight=0.5,
+    )
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn
+    )
+
+    for x_1, transcription_ids, cond, mask in dataloader:
+        print(x_1.shape)
+        print(transcription_ids.shape)
+        print(cond.shape)
+
+        
+        # print(cond)
+        # print("="*100)
+        # print(x_1)
+        # print(transcription_ids)
+        break
+
+    # print()
+
+    # metadata_path = "/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R/libri_tts-train-clean-960.csv"
+    # data = pd.read_csv(metadata_path)
+
+    # text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
+
+    # dataset = DurationBPEOfflineDataset(
+    #     data=data,
+    #     base_dir="/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R",
+    #     text_tokenizer=text_tokenizer
+    # )
+
+    # collate_fn = DurationBPEOfflineCollateFunc(
+    #     max_audio_length=2048,
+    #     text_pad_token=0,
+    #     audio_pad_token=65537,
+    #     audio_bos_token=65536,  # BOS token for audio
+    # )
+
     # dataloader = torch.utils.data.DataLoader(
     #     dataset,
     #     batch_size=4,
@@ -514,45 +871,9 @@ def main():
     #     collate_fn=collate_fn
     # )
 
-    # for x_1, transcription_ids, cond in dataloader:
-    #     print(x_1.shape)
-    #     print(transcription_ids.shape)
-    #     print(cond.shape)
-
-    #     print(x_1)
-    #     print(cond)
-    #     print(transcription_ids)
+    # for batch in dataloader:
+    #     print(batch)
     #     break
-
-    metadata_path = "/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R/libri_tts-train-clean-960.csv"
-    data = pd.read_csv(metadata_path)
-
-    text_tokenizer = VoiceBpeTokenizer(vocab_file="../config/vocab.json")
-
-    dataset = DurationBPEOfflineDataset(
-        data=data,
-        base_dir="/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R",
-        text_tokenizer=text_tokenizer
-    )
-
-    collate_fn = DurationBPEOfflineCollateFunc(
-        max_audio_length=2048,
-        text_pad_token=0,
-        audio_pad_token=65537,
-        audio_bos_token=65536,  # BOS token for audio
-    )
-
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=4,
-        shuffle=True,
-        num_workers=8,
-        collate_fn=collate_fn
-    )
-
-    for batch in dataloader:
-        print(batch)
-        break
 
 
 if __name__ == "__main__":

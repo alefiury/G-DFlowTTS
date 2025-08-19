@@ -1,13 +1,14 @@
-title: DFMTTS-Cross-Attention-LibriTTSR-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-LibriTTSR-Dynamic-Duration-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
-model_type: "dit_crossattn"
+model_type: "dit_adaln"
 # source_dist_type: "uniform"
 source_dist_type: "mask"
 
 datasets:
-    type: "offline"
+    # type: "offline"
+    type: "offline_dynamic_dur"
 
     train_metadata: "/raid/aluno_alef/DATASETS/train_dfm_ablation.csv"
     val_metadata: "/raid/aluno_alef/DATASETS/dev_dfm_ablation.csv"
@@ -31,10 +32,14 @@ datasets:
 
     audio_mask_token: 65536
     audio_pad_token: 65537
+    audio_expand_token: 65538
+    audio_delete_token: 65539
 
+    # mask_prob: [0.5, 1.0]
     mask_prob: [0.7, 1.0]
 
     use_mask: true
+    # mask_type: "random"
     mask_type: "contiguous"
     audio_pad_type: "variable"
 
@@ -45,25 +50,23 @@ datasets:
     # cond_drop_prob: 0.0
     assert_drop_prob: true
 
-    guidance_scale: 5.0
+    guidance_scale: 2.5
+
+    mix_ratio: 0.5 # mix static/dynamic merge (0..1)
+    p_merge_static: 0.5 # fixed merge prob for each masked span
+    p_merge_dynamic_scale: 0.5 # ~ inversely proportional to num masked tokens
+    # How many <DELETE> to insert (fraction of current length)
+    delete_frac_range: [0.00, 0.10]
 
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
-    audio_pad_token: ${datasets.audio_pad_token}
     text_vocab_size: ${datasets.text_vocab_size}
     hidden_size: 768
     cond_dim: 128
     n_heads: 12
     n_blocks: 12
     dropout: 0.1
-    add_token: 2
-
-    use_linear_attn: false
-    use_mix_ffn: false
-    qk_norm: true
-    cross_qk_norm: true
-    mlp_ratio: 4
-
+    add_token: 4 # PAD, MASK, EXPAND, DELETE
 
 train:
     batch_size: 32
@@ -87,15 +90,17 @@ scheduler:
 trainer:
     accelerator: "gpu"
     # max_epochs: 100
-    max_steps: 250000
+    max_steps: 500000
     # max_steps: 1000000
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
-    val_check_interval: 1.0 # Every 1 epoch
+    # val_check_interval: 1.0 # Every 1 epoch
+    val_check_interval: 10000
     accumulate_grad_batches: 4
+    precision: bf16
 
 model_checkpoint:
     mode: "min"

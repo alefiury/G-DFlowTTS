@@ -1,17 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the CC-by-NC license found in the
-# LICENSE file in the root directory of this source tree.
-# Part of this implementation is adapted from https://github.com/facebookresearch/DiT
-# which is released under NonCommercial-4.0 license
-# Part of this implementation is adapted from https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-# which is released under MIT license
-# Part of this implementation is adapted from https://github.com/louaaron/Score-Entropy-Discrete-Diffusion
-# which is released under MIT license
-# Part of this implementation is adapted from https://github.com/facebookresearch/flow_matching
-# which is released under NonCommercial-4.0 license
-
 import math
 from typing import Optional
 
@@ -19,6 +5,13 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn, Tensor
+from flash_attn import flash_attn_func
+
+try:
+    from flash_attn import flash_attn_func
+    _flash_attn_available = True
+except ImportError:
+    _flash_attn_available = False
 
 from modules import rotary
 
@@ -172,9 +165,9 @@ class DDiTBlock(nn.Module):
             ).to(original_dtype)
 
         q, k, v = (item.transpose(1, 2) for item in (q, k, v))
-
         x = F.scaled_dot_product_attention(query=q, key=k, value=v)
         x = rearrange(x, "b h s d -> b s (h d)", b=batch_size)
+
         x = bias_dropout_add_scale(
             x=self.attn_out(x),
             scale=gate_msa,
@@ -224,7 +217,7 @@ class Transformer(nn.Module):
         dropout: int,
         n_blocks: int,
         add_token: int = 2, # mask + padding tokens
-        audio_pad_token: Optional[int] = 0,
+        audio_pad_token: Optional[int] = 0
     ):
         super().__init__()
         self.audio_vocab_size = audio_vocab_size
@@ -239,9 +232,11 @@ class Transformer(nn.Module):
         self.time_embedding = TimestepEmbedder(hidden_size=cond_dim)
         self.rotary_emb = rotary.Rotary(dim=hidden_size // n_heads)
 
+        # Conditioning dimension
+        cond_channels = 2
         # Project concatenated audio and text embeddings back to hidden_size
-        # * 3 because we concatenate audio, text and cond embeddings
-        self.input_proj = nn.Linear(hidden_size * 3, hidden_size)
+        # * (2) because we concatenate audio and text embeddings (optional)
+        self.input_proj = nn.Linear(hidden_size * cond_channels, hidden_size)
 
         self.blocks = nn.ModuleList(
             [
@@ -265,31 +260,24 @@ class Transformer(nn.Module):
         self,
         x_t: Tensor,
         text: Tensor,
-        cond: Tensor,
+        text_att_mask: Tensor,
         time: Tensor,
         drop_text: bool = False,
-        drop_cond: bool = False,
     ) -> Tensor:
         audio_emb = self.audio_embed(x_t)
         seq_len = audio_emb.shape[1]
 
         # Text Embedding
-        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx() (based on E2 TTS)
         text = text[:, :seq_len]
         text = F.pad(text, (0, seq_len - text.shape[1]), value=0.0)
 
-        # Classifier Free Guidance (CFG)
+        # Classifier Free Guidance (CFG) for the text conditioning
         if drop_text:
             text = torch.zeros_like(text)
         text_emb = self.text_embed(text)
 
-        # Classifier Free Guidance (CFG)
-        if drop_cond:
-            cond = torch.ones_like(cond) * self.audio_pad_token
-        cond_emb = self.audio_embed(cond)
-
-        # Concatenate audio, text and cond embeddings in the channel dimension
-        x = torch.cat([audio_emb, cond_emb, text_emb], dim=-1)
+        x = torch.cat([audio_emb, text_emb], dim=-1)
         # Project concatenated audio and text embeddings back to hidden_size
         x = self.input_proj(x)
 

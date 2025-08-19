@@ -1,10 +1,16 @@
 import math
-from typing import Optional, Literal
+from typing import Optional
 
 import torch
-from torch import nn, Tensor
 import torch.nn.functional as F
 from einops import rearrange
+from torch import nn, Tensor
+
+try:
+    from flash_attn import flash_attn_func
+    _flash_attn_available = True
+except Exception:
+    _flash_attn_available = False
 
 from modules import rotary
 
@@ -35,23 +41,7 @@ class LayerNorm(nn.Module):
         return x * self.weight[None, None, :]
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return (self.weight * self._norm(x.float())).type_as(x)
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-
 class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
         self.mlp = nn.Sequential(
@@ -72,9 +62,7 @@ class TimestepEmbedder(nn.Module):
         args = time[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, time: Tensor) -> Tensor:
@@ -83,342 +71,234 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LinearAttention(nn.Module):
-    """SANA-style Linear Attention"""
-    def __init__(self, dim: int, n_heads: int, qk_norm: bool = True):
-        super().__init__()
-        assert dim % n_heads == 0
-        self.n_heads = n_heads
-        self.dim = dim
-        self.head_dim = dim // n_heads
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-
-        if qk_norm:
-            self.q_norm = RMSNorm(dim)
-            self.k_norm = RMSNorm(dim)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
-
-    def forward(self, x: Tensor, rotary_cos_sin: Optional[Tensor] = None) -> Tensor:
-        B, N, C = x.shape
-
-        qkv = self.qkv(x).reshape(B, N, 3, C)
-        q, k, v = qkv.unbind(2)
-
-        # Apply normalization
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Reshape for multi-head attention
-        q = q.reshape(B, N, self.n_heads, self.head_dim)
-        k = k.reshape(B, N, self.n_heads, self.head_dim)
-        v = v.reshape(B, N, self.n_heads, self.head_dim)
-
-        # Apply rotary embeddings if provided
-        if rotary_cos_sin is not None:
-            cos, sin = rotary_cos_sin
-            q = rotary.apply_rotary_emb_torch(
-                x=q.float(),
-                cos=cos.float(),
-                sin=sin.float()
-            ).to(q.dtype)
-            k = rotary.apply_rotary_emb_torch(
-                x=k.float(),
-                cos=cos.float(),
-                sin=sin.float()
-            ).to(k.dtype)
-
-        # Transpose for attention computation
-        q = q.transpose(1, 2)  # (B, H, N, D)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Linear attention with ReLU
-        q = F.relu(q)
-        k = F.relu(k)
-
-        # Compute shared terms for efficiency
-        kv = torch.matmul(k.transpose(-2, -1), v)  # (B, H, D, D)
-        k_sum = k.sum(dim=-2, keepdim=True)  # (B, H, 1, D)
-
-        # Compute attention output
-        out = torch.matmul(q, kv) / (torch.matmul(q, k_sum.transpose(-2, -1)) + 1e-6)
-
-        # Reshape back
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.out_proj(out)
-
-        return out
-
-
-class CrossAttention(nn.Module):
-    """Multi-head Cross Attention"""
+class MultiHeadSelfAttention(nn.Module):
+    """
+    Self-attention with rotary on (q,k). Uses FlashAttention if available and no attn_mask;
+    otherwise falls back to PyTorch SDPA. Returns projected output.
+    """
     def __init__(
         self,
-        dim: int,
-        n_heads: int,
-        context_dim: Optional[int] = None,
-        qk_norm: bool = False,
-        attention_type: Literal["vanilla", "linear"] = "vanilla"
+        d_model: int,
+        num_heads: int,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
     ):
         super().__init__()
-        assert dim % n_heads == 0
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.attn_drop = attn_drop
 
-        self.n_heads = n_heads
-        self.dim = dim
-        self.head_dim = dim // n_heads
-        self.context_dim = context_dim or dim
-        self.attention_type = attention_type
-
-        self.q = nn.Linear(dim, dim, bias=False)
-        self.kv = nn.Linear(self.context_dim, dim * 2, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-
-        if qk_norm:
-            self.q_norm = RMSNorm(dim)
-            self.k_norm = RMSNorm(dim)
-        else:
-            self.q_norm = nn.Identity()
-            self.k_norm = nn.Identity()
-
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
-        B, N, C = x.shape
-        _, M, _ = context.shape
-
-        q = self.q(x)
-        kv = self.kv(context).reshape(B, M, 2, C)
-        k, v = kv.unbind(2)
-
-        # Apply normalization
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Reshape for multi-head attention
-        q = q.reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(B, M, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(B, M, self.n_heads, self.head_dim).transpose(1, 2)
-
-        if self.attention_type == "vanilla":
-            # Standard scaled dot-product attention
-            out = F.scaled_dot_product_attention(q, k, v)
-        else:  # linear
-            # SANA-style linear cross-attention
-            q = F.relu(q)
-            k = F.relu(k)
-
-            # Compute shared terms
-            kv = torch.matmul(k.transpose(-2, -1), v)  # (B, H, D, D)
-            k_sum = k.sum(dim=-2, keepdim=True)  # (B, H, 1, D)
-
-            # Compute attention output
-            out = torch.matmul(q, kv) / (torch.matmul(q, k_sum.transpose(-2, -1)) + 1e-6)
-
-        # Reshape back
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.out_proj(out)
-
-        return out
-
-
-class MixFFN(nn.Module):
-    """SANA-style Mix-FFN with depth-wise convolution"""
-    def __init__(self, dim: int, mlp_ratio: int = 4):
-        super().__init__()
-        hidden_dim = int(dim * mlp_ratio)
-
-        # Inverted residual block with GLU
-        self.fc1 = nn.Linear(dim, hidden_dim * 2, bias=True)
-        self.dwconv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3,
-                                padding=1, groups=hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, dim, bias=True)
-
-    def forward(self, x: Tensor) -> Tensor:
-        B, N, C = x.shape
-
-        # GLU activation
-        x_gate = self.fc1(x)
-        x, gate = x_gate.chunk(2, dim=-1)
-        x = x * F.silu(gate)
-
-        # Apply depth-wise convolution
-        x = x.transpose(1, 2)  # (B, C, N)
-        x = self.dwconv(x)
-        x = x.transpose(1, 2)  # (B, N, C)
-
-        # Final projection
-        x = self.fc2(x)
-
-        return x
-
-
-class CrossDiTBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        n_heads: int,
-        context_dim: int,
-        cond_dim: int,
-        mlp_ratio: int = 4,
-        dropout: float = 0.1,
-        use_linear_attn: bool = False,
-        use_mix_ffn: bool = False,
-        qk_norm: bool = True,
-        cross_qk_norm: bool = True,
-    ):
-        super().__init__()
-        self.n_heads = n_heads
-        self.dim = dim
-        self.dropout = dropout
-        self.use_linear_attn = use_linear_attn
-
-        # Self-attention
-        self.norm1 = LayerNorm(dim=dim)
-        if use_linear_attn:
-            self.self_attn = LinearAttention(dim, n_heads, qk_norm=qk_norm)
-        else:
-            # Vanilla self-attention
-            self.qw = nn.Linear(dim, dim, bias=False)
-            self.kw = nn.Linear(dim, dim, bias=False)
-            self.vw = nn.Linear(dim, dim, bias=False)
-            self.attn_out = nn.Linear(dim, dim, bias=False)
-
-            if qk_norm:
-                self.q_norm = LayerNorm(dim)
-                self.k_norm = LayerNorm(dim)
-            else:
-                self.q_norm = nn.Identity()
-                self.k_norm = nn.Identity()
-
-        self.dropout1 = nn.Dropout(dropout)
-
-        # Cross-attention
-        self.norm_cross = LayerNorm(dim=dim)
-        self.cross_attn = CrossAttention(
-            dim,
-            n_heads,
-            context_dim=context_dim,
-            qk_norm=cross_qk_norm,
-            attention_type="linear" if use_linear_attn else "vanilla"
-        )
-        self.dropout_cross = nn.Dropout(dropout)
-
-        # Feed-forward
-        self.norm2 = LayerNorm(dim=dim)
-        if use_mix_ffn:
-            self.mlp = MixFFN(dim, mlp_ratio)
-        else:
-            self.mlp = nn.Sequential(
-                nn.Linear(dim, mlp_ratio * dim, bias=True),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(mlp_ratio * dim, dim, bias=True),
-            )
-
-        # AdaLN modulation - we need 9 parameters for cross-attention
-        self.adaLN_modulation = nn.Linear(cond_dim, 9 * dim, bias=True)
-        self.adaLN_modulation.weight.data.zero_()
-        self.adaLN_modulation.bias.data.zero_()
-
-        self.head_dim = self.dim // self.n_heads
+        self.q_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.k_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.v_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.proj      = nn.Linear(d_model, d_model, bias=False)
+        self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
         self,
-        x: Tensor,
-        context: Tensor,
-        rotary_cos_sin: Tensor,
+        x: Tensor, # (B, S, D)
+        rotary_cos_sin: Optional[Tensor], # tuple(cos, sin) from rotary for audio stream
+        attn_mask: Optional[Tensor] = None # if needed in future; None by default
+    ) -> Tensor:
+        B, S, D = x.shape
+        H, Hd   = self.num_heads, self.head_dim
+
+        # Projections
+        q = self.q_linear(x).view(B, S, H, Hd)
+        k = self.k_linear(x).view(B, S, H, Hd)
+        v = self.v_linear(x).view(B, S, H, Hd)
+
+        # Rotary on q,k
+        if rotary_cos_sin is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                cos, sin = rotary_cos_sin
+                orig_dtype = q.dtype
+                q = rotary.apply_rotary_emb_torch(q.float(), cos.float(), sin.float()).to(orig_dtype)
+                k = rotary.apply_rotary_emb_torch(k.float(), cos.float(), sin.float()).to(orig_dtype)
+
+        # SDPA expects (B,H,S,D)
+        q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q_, k_, v_,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop if self.training else 0.0
+        ) # (B,H,S,Hd)
+        out = rearrange(out, "b h s d -> b s (h d)")
+
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+class MultiHeadCrossAttention(nn.Module):
+    """
+    Cross-attention: queries from x (audio), keys/values from cond (text).
+    Uses FlashAttention when available and no padding mask is needed; otherwise SDPA.
+    key_padding_mask: (B, St) bool where True = valid (kept).
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.attn_drop = attn_drop
+
+        self.q_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.k_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.v_linear  = nn.Linear(d_model, d_model, bias=False)
+        self.proj      = nn.Linear(d_model, d_model, bias=False)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(
+        self,
+        x: Tensor,                        # (B, Sa, D) queries
+        cond: Tensor,                     # (B, St, D) keys/values
+        key_padding_mask: Optional[Tensor] = None  # (B, St) bool, True=valid
+    ) -> Tensor:
+        B, Sa, D = x.shape
+        St = cond.shape[1]
+        H  = self.num_heads
+        Hd = self.head_dim
+
+        # Linear projections
+        q_lin = self.q_linear(x)          # (B, Sa, D)
+        k_lin = self.k_linear(cond)       # (B, St, D)
+        v_lin = self.v_linear(cond)       # (B, St, D)
+
+        # SDPA with key padding mask
+        q = q_lin.view(B, Sa, H, Hd).transpose(1, 2)  # (B,H,Sa,Hd)
+        k = k_lin.view(B, St, H, Hd).transpose(1, 2)  # (B,H,St,Hd)
+        v = v_lin.view(B, St, H, Hd).transpose(1, 2)  # (B,H,St,Hd)
+
+        attn_mask = None
+        if key_padding_mask is not None:
+            # SDPA expects True = mask(disallow); ours True = keep => invert
+            attn_mask = (~key_padding_mask)[:, None, None, :]  # (B,1,1,St)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_drop if self.training else 0.0
+        )                               # (B,H,Sa,Hd)
+        out = rearrange(out, "b h s d -> b s (h d)")
+
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+class DDiTBlockCross(nn.Module):
+    """
+    Keep the original structure with explicit skip connections:
+      x -> (SelfAttn) -> skip -> (CrossAttn) -> skip -> (MLP) -> skip
+    All modulated by adaLN(time). Reuse gate_msa for both attn residuals (minimal change).
+    """
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        cond_dim: int,
+        mlp_ratio: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+
+        self.n_heads = n_heads
+        self.dim = dim
+        self.dropout = dropout
+
+        # Self-attention + norm
+        self.norm1 = LayerNorm(dim=dim)
+        self.self_attn = MultiHeadSelfAttention(
+            d_model=dim,
+            num_heads=n_heads,
+            attn_drop=dropout,
+            proj_drop=dropout
+        )
+
+        # Cross-attention + norm
+        self.norm_xattn = LayerNorm(dim=dim)
+        self.cross_attn = MultiHeadCrossAttention(
+            d_model=dim,
+            num_heads=n_heads,
+            attn_drop=dropout,
+            proj_drop=dropout
+        )
+
+        # MLP
+        self.norm2 = LayerNorm(dim=dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_ratio * dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_ratio * dim, dim, bias=True),
+        )
+
+        # adaLN (time)
+        self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
+        self.adaLN_modulation.weight.data.zero_()
+        self.adaLN_modulation.bias.data.zero_()
+
+    def forward(
+        self,
+        x: Tensor,                   # (B, Sa, D)
+        text_emb: Tensor,            # (B, St, D)
+        text_att_mask: Optional[Tensor],  # (B, St) bool: True=valid
+        rotary_cos_sin: Optional[Tensor],
         c: Tensor
     ) -> Tensor:
-        batch_size, seq_len = x.shape[0], x.shape[1]
-
-        # Get modulation parameters - expecting 9 values
         (
             shift_msa,
             scale_msa,
             gate_msa,
-            shift_cross,
-            scale_cross,
-            gate_cross,
             shift_mlp,
             scale_mlp,
             gate_mlp,
-        ) = self.adaLN_modulation(c)[:, None].chunk(9, dim=2)
+        ) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
 
-        # Self-attention
-        x_skip = x
-        x_norm = modulate(x=self.norm1(x), shift=shift_msa, scale=scale_msa)
-
-        if self.use_linear_attn:
-            x_attn = self.self_attn(x_norm, rotary_cos_sin)
-        else:
-            # Vanilla self-attention path
-            q = self.qw(x_norm)
-            k = self.kw(x_norm)
-            v = self.vw(x_norm)
-
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-            q, k, v = (
-                item.view(batch_size, seq_len, self.n_heads, self.head_dim)
-                for item in (q, k, v)
-            )
-
-            with torch.amp.autocast("cuda", enabled=False):
-                cos, sin = rotary_cos_sin
-                original_dtype = q.dtype
-
-                q = rotary.apply_rotary_emb_torch(
-                    x=q.float(),
-                    cos=cos.float(),
-                    sin=sin.float()
-                ).to(original_dtype)
-                k = rotary.apply_rotary_emb_torch(
-                    x=k.float(),
-                    cos=cos.float(),
-                    sin=sin.float()
-                ).to(original_dtype)
-
-            q, k, v = (item.transpose(1, 2) for item in (q, k, v))
-
-            x_attn = F.scaled_dot_product_attention(query=q, key=k, value=v)
-            x_attn = rearrange(x_attn, "b h s d -> b s (h d)", b=batch_size)
-            x_attn = self.attn_out(x_attn)
-
+        # ---- Self-attention + skip ----
+        x_sa_in = modulate(self.norm1(x), shift=shift_msa, scale=scale_msa)
+        sa_out = self.self_attn(x_sa_in, rotary_cos_sin=rotary_cos_sin, attn_mask=None)
         x = bias_dropout_add_scale(
-            x=x_attn,
+            x=sa_out,
             scale=gate_msa,
-            residual=x_skip,
-            prob=self.dropout,
-            training=self.training,
-        )
-
-        # Cross-attention
-        x_skip = x
-        x_norm = modulate(x=self.norm_cross(x), shift=shift_cross, scale=scale_cross)
-        x_cross = self.cross_attn(x_norm, context)
-        x = bias_dropout_add_scale(
-            x=x_cross,
-            scale=gate_cross,
-            residual=x_skip,
-            prob=self.dropout,
-            training=self.training,
-        )
-
-        # Feed-forward
-        x = bias_dropout_add_scale(
-            x=self.mlp(modulate(x=self.norm2(x), shift=shift_mlp, scale=scale_mlp)),
-            scale=gate_mlp,
             residual=x,
             prob=self.dropout,
             training=self.training,
         )
 
+        # ---- Cross-attention + skip ----
+        x_ca_in = modulate(self.norm_xattn(x), shift=shift_msa, scale=scale_msa)
+        ca_out = self.cross_attn(x_ca_in, text_emb, key_padding_mask=text_att_mask)
+        x = bias_dropout_add_scale(
+            x=ca_out,
+            scale=gate_msa,
+            residual=x,
+            prob=self.dropout,
+            training=self.training,
+        )
+
+        # ---- MLP + skip ----
+        x = bias_dropout_add_scale(
+            x=self.mlp(modulate(self.norm2(x), shift=shift_mlp, scale=scale_mlp)),
+            scale=gate_mlp,
+            residual=x,
+            prob=self.dropout,
+            training=self.training,
+        )
         return x
 
 
-class CrossDitFinalLayer(nn.Module):
+class DDitFinalLayer(nn.Module):
     def __init__(self, hidden_size: int, out_channels: int, cond_dim: int):
         super().__init__()
         self.norm_final = LayerNorm(hidden_size)
@@ -432,12 +312,16 @@ class CrossDitFinalLayer(nn.Module):
 
     def forward(self, x: Tensor, c: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
-        x = modulate(x=self.norm_final(x), shift=shift, scale=scale)
+        x = modulate(self.norm_final(x), shift=shift, scale=scale)
         x = self.linear(x)
         return x
 
 
-class CrossTransformer(nn.Module):
+class TransformerCrossAttn(nn.Module):
+    """
+    Text is injected via cross-attention (as memory), time via adaLN.
+    Self-attn path keeps FlashAttention when available.
+    """
     def __init__(
         self,
         audio_vocab_size: int,
@@ -447,51 +331,35 @@ class CrossTransformer(nn.Module):
         n_heads: int,
         dropout: int,
         n_blocks: int,
-        add_token: int = 2,  # mask + padding tokens
-        audio_pad_token: Optional[int] = 0,
-        use_linear_attn: bool = False,  # Use SANA linear attention
-        use_mix_ffn: bool = False,  # Use SANA Mix-FFN
-        qk_norm: bool = True,  # QK normalization for self-attention
-        cross_qk_norm: bool = True,  # QK normalization for cross-attention
-        mlp_ratio: int = 4,
+        add_token: int = 2,
+        audio_pad_token: Optional[int] = 0
     ):
         super().__init__()
         self.audio_vocab_size = audio_vocab_size
         self.audio_pad_token = audio_pad_token
         self.text_vocab_size = text_vocab_size
-        self.use_linear_attn = use_linear_attn
 
-        # Embeddings
         self.audio_embed = nn.Embedding(self.audio_vocab_size + add_token, hidden_size)
-        self.text_embed = nn.Embedding(self.text_vocab_size + 1, hidden_size)
+        self.text_embed  = nn.Embedding(self.text_vocab_size + 1, hidden_size)  # +1 for filler=0
 
-        # Time embedding
         self.time_embedding = TimestepEmbedder(hidden_size=cond_dim)
-
-        # Rotary embeddings (only used for self-attention)
         self.rotary_emb = rotary.Rotary(dim=hidden_size // n_heads)
 
-        # Transformer blocks with cross-attention
+        self.input_proj = nn.Linear(hidden_size, hidden_size)
+
         self.blocks = nn.ModuleList(
             [
-                CrossDiTBlock(
+                DDiTBlockCross(
                     dim=hidden_size,
                     n_heads=n_heads,
-                    context_dim=hidden_size * 2,  # text + cond concatenated
                     cond_dim=cond_dim,
                     dropout=dropout,
-                    mlp_ratio=mlp_ratio,
-                    use_linear_attn=use_linear_attn,
-                    use_mix_ffn=use_mix_ffn,
-                    qk_norm=qk_norm,
-                    cross_qk_norm=cross_qk_norm,
                 )
                 for _ in range(n_blocks)
             ]
         )
 
-        # Output layer
-        self.output_layer = CrossDitFinalLayer(
+        self.output_layer = DDitFinalLayer(
             hidden_size=hidden_size,
             out_channels=audio_vocab_size + add_token,
             cond_dim=cond_dim,
@@ -499,47 +367,39 @@ class CrossTransformer(nn.Module):
 
     def forward(
         self,
-        x_t: Tensor,
-        text: Tensor,
-        cond: Tensor,
-        time: Tensor,
+        x_t: Tensor,               # (B, Sa)
+        text: Tensor,              # (B, St) int ids
+        text_att_mask: Tensor,     # (B, St) bool: True for valid tokens
+        time: Tensor,              # (B,)
         drop_text: bool = False,
-        drop_cond: bool = False,
     ) -> Tensor:
-        # Audio embedding
-        audio_emb = self.audio_embed(x_t)
-        seq_len = audio_emb.shape[1]
+        # Audio embeddings
+        x = self.audio_embed(x_t)          # (B, Sa, D)
+        x = self.input_proj(x)             # (B, Sa, D)
 
-        # Text Embedding
-        text = text + 1  # use 0 as filler token
-        text = text[:, :seq_len]
-        text = F.pad(text, (0, seq_len - text.shape[1]), value=0.0)
-
-        # Classifier Free Guidance (CFG) for text
+        # Text embeddings (+1 shift so 0 is filler)
+        text_ids = text + 1
         if drop_text:
-            text = torch.zeros_like(text)
-        text_emb = self.text_embed(text)
-
-        # Classifier Free Guidance (CFG) for condition
-        if drop_cond:
-            cond = torch.ones_like(cond) * self.audio_pad_token
-        cond_emb = self.audio_embed(cond)
-
-        # Create context by concatenating text and condition embeddings
-        context = torch.cat([text_emb, cond_emb], dim=-1)
+            text_ids = torch.zeros_like(text_ids) # Filler tokens to represent "dropped text" for PFG
+            text_att_mask = torch.ones_like(text_att_mask, dtype=torch.bool) # This will be inverted to False in the cross attention module
+        text_emb = self.text_embed(text_ids)  # (B, St, D)
 
         # Time conditioning
-        c = F.silu(self.time_embedding(time=time))
+        c = F.silu(self.time_embedding(time=time))  # (B, cond_dim)
 
-        # Get rotary embeddings for self-attention
-        rotary_cos_sin = self.rotary_emb(x=audio_emb)
+        # Rotary (audio stream) for self-attn
+        rotary_cos_sin = self.rotary_emb(x=x)
 
-        # Process through transformer blocks
-        x = audio_emb
-        for block in self.blocks:
-            x = block(x=x, context=context, rotary_cos_sin=rotary_cos_sin, c=c)
+        # Blocks
+        for blk in self.blocks:
+            x = blk(
+                x=x,
+                text_emb=text_emb,
+                text_att_mask=text_att_mask,
+                rotary_cos_sin=rotary_cos_sin,
+                c=c
+            )
 
-        # Final output
+        # Logits
         x = self.output_layer(x=x, c=c)
-
         return x

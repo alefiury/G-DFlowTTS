@@ -42,7 +42,8 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
             max_audio_duration=config.datasets.max_audio_duration,
             speech_processor=speech_processor,
         )
-    elif config.datasets.type == "offline":
+    elif config.datasets.type == "offline" or \
+        config.datasets.type == "offline_dynamic_dur":
         train_dataset = OfflineMultipleSpeakerDataset(
             data=train_df,
             base_dir=config.datasets.base_dir,

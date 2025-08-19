@@ -4,7 +4,7 @@ import logging
 import argparse
 import warnings
 from pprint import pprint
-from typing import Tuple
+from typing import Tuple, Optional
 warnings.filterwarnings("ignore")
 
 import wandb
@@ -60,11 +60,122 @@ def get_remaining_duration(
     return torch.argmax(remaining_duration[:, -1], dim=-1).item()
 
 
+# def apply_vlg_ops(
+#     x: torch.Tensor,                  # [B, L] tokens predicted at current step
+#     mask_token: int,
+#     expand_token: int,
+#     delete_token: int,
+#     max_len: int
+# ):
+#     """
+#     Apply DreamOn heuristic in-place:
+#     - <EXPAND> -> two <MASK> at same position
+#     - <DELETE> -> remove that token
+#     Returns a possibly length-changed, padded back to max_len with PAD
+#     """
+#     B, L = x.shape
+#     out = []
+#     for b in range(B):
+#         seq = x[b].tolist()
+#         new_seq = []
+#         for t in seq:
+#             if t == expand_token:
+#                 new_seq.append(mask_token)
+#                 new_seq.append(mask_token)
+#             elif t == delete_token:
+#                 # skip it (deletion)
+#                 continue
+#             else:
+#                 new_seq.append(t)
+#         new_seq = new_seq[:max_len]
+#         out.append(torch.tensor(new_seq, device=x.device, dtype=x.dtype))
+#     # pad to common length
+#     maxL = min(max_len, max(s.numel() for s in out) if out else L)
+#     padded = x.new_full((B, maxL), fill_value=mask_token)  # keep masked tail
+#     for b, s in enumerate(out):
+#         padded[b, :min(maxL, s.numel())] = s[:maxL]
+#     return padded
+
+
+def apply_vlg_ops(
+    x: torch.Tensor,                  # [B, L]
+    mask_token: int,
+    expand_token: int,
+    delete_token: int,
+    max_len: int,
+    edit_start: int = 0,              # first editable index (e.g., codes_ref_size)
+    edit_end: Optional[int] = None,   # last editable index (exclusive); None => full length
+):
+    """
+    Variable-length growth (expand) & shrink (delete), applied ONLY in [edit_start, edit_end).
+    - <EXPAND>  -> replace with [MASK, MASK]
+    - <DELETE>  -> remove the nearest real LEFT neighbor *and* the <DELETE> itself (no mask appended)
+    Then re-pad with MASK to max_len (so new slots are fillable on later steps).
+    """
+    B, L = x.shape
+    SENTINELS = {mask_token, expand_token, delete_token}
+
+    out = []
+    for b in range(B):
+        seq = x[b].tolist()
+        if edit_end is None or edit_end > len(seq):
+            e_end = len(seq)
+        else:
+            e_end = edit_end
+
+        new_seq = []
+
+        # Copy prefix (non-editable head)
+        if edit_start > 0:
+            new_seq.extend(seq[:edit_start])
+
+        # Work on editable window
+        i = edit_start
+        while i < e_end:
+            t = seq[i]
+
+            # EXPAND: replace with two MASKs
+            if t == expand_token:
+                new_seq.append(mask_token)
+                new_seq.append(mask_token)
+                i += 1
+                continue
+
+            # DELETE: drop left real neighbor + the DELETE itself
+            if t == delete_token:
+                # # find a real (non-sentinel) left neighbor inside the editable window *or* in prefix
+                # j = len(new_seq) - 1
+                # while j >= 0 and new_seq[j] in SENTINELS:
+                #     j -= 1
+                # if j >= 0:
+                #     new_seq.pop(j)   # remove the real token
+                # # skip the DELETE itself by not appending it
+                i += 1
+                continue
+
+            # Otherwise keep the token
+            new_seq.append(t)
+            i += 1
+
+        # Copy tail (non-editable)
+        if e_end < len(seq):
+            new_seq.extend(seq[e_end:])
+
+        # truncate then pad with MASK so new slots are fillable next steps
+        new_seq = new_seq[:max_len]
+        padded = [mask_token] * max_len
+        upto = min(len(new_seq), max_len)
+        padded[:upto] = new_seq[:upto]
+        out.append(torch.tensor(padded, device=x.device, dtype=x.dtype))
+
+    return torch.stack(out, dim=0)
+
+
+
 @torch.inference_mode()
 def inference(
     config,
     model,
-    duration_model,
     tokenizer,
     sentence,
     nsf: int = 10,
@@ -73,10 +184,7 @@ def inference(
     sequence_length: int = 300,
     device: torch.device = torch.device("cuda")
 ) -> Tensor:
-    if text_ref is not None:
-        augmented_sentence = text_ref + " " + sentence
-    else:
-        augmented_sentence = sentence
+    augmented_sentence = text_ref + " " + sentence
     # text_ids = tokenizer.encode(augmented_sentence, lang="en-us")
     text_ids = tokenizer.encode(augmented_sentence, lang="pt-br")
 
@@ -89,50 +197,23 @@ def inference(
     )
     # Set the number of predictor steps (you can adjust this or read it from config)
     num_steps = nsf  # for example, 10 steps from t=0 to t=1
-    num_corrector_steps = 1  # number of corrector iterations per predictor step
+    num_corrector_steps = 10  # number of corrector iterations per predictor step
 
     # Create a time grid from 0 to 1 with (num_steps + 1) points
     t_init = 0.0
-    t_final = 2.0
+    t_final = 1.0
     time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=device)
-
-    sequence_length = get_remaining_duration(
-        duration_model,
-        text_ids=text_ids,
-        codes_ref=codes_ref,
-        device=device
-    )
-
-    sequence_length += 50
-
-    print("-"*100)
-    print("Predicted sequence length:", sequence_length)
-    print("codes_ref.size(0):", codes_ref.size(0))
 
     # Initialize x_t; for example, using the masked source
     xt = source_distribution.sample((1, sequence_length + codes_ref.size(0)), device=device)
-
     orig_ref_code_len = codes_ref.size(0)
-
-    print("-"*100)
-    print(xt.shape, codes_ref.shape)
-
-    # x_t[:, : codes_ref.shape[-1]] = codes_ref
-
-    # if codes_ref.size(0) < config.datasets.max_audio_length:
-    #     codes_ref = F.pad(codes_ref, (0, config.datasets.max_audio_length - codes_ref.size(0)), value=config.datasets.audio_mask_token).unsqueeze(0)
 
     if codes_ref.size(0) < sequence_length + codes_ref.size(0):
         codes_ref = F.pad(codes_ref, (0, sequence_length), value=config.datasets.audio_mask_token).unsqueeze(0)
 
-    # print(codes_ref)
-    # print(codes_ref.shape)
-
     num_steps = nsf
     dt = 1.0 / num_steps
     x1_temp = 1.0
-    guidance_scale = config.datasets.guidance_scale
-    # gamma = config.datasets.guidance_scale
     gamma = 2.5
     mask_token_id = config.datasets.audio_mask_token
     S = vocab_size
@@ -142,15 +223,7 @@ def inference(
     mask_one_hot = torch.zeros((S), device=model.device)
     mask_one_hot[mask_token_id] = 1.0
 
-    print("="*100)
-
-    print(xt.shape, codes_ref.shape)
     xt[..., : orig_ref_code_len] = codes_ref[..., : orig_ref_code_len]
-    print(xt.shape, codes_ref.shape)
-
-    # print("="*100)
-    # print(xt)
-    # print(codes_ref)
 
     # Loop over the time grid
     for step in range(num_steps):
@@ -189,50 +262,55 @@ def inference(
 
         xt = torch.multinomial(P.view(-1, S), 1).view_as(xt)
 
+        xt = apply_vlg_ops(
+            x=xt,
+            mask_token=config.datasets.audio_mask_token,
+            expand_token=config.datasets.audio_expand_token,
+            delete_token=config.datasets.audio_delete_token,
+            max_len=config.test.max_audio_length,
+            edit_start=orig_ref_code_len,
+            edit_end=None
+        )
+
+        # codes_ref needs to have the same size as xt
+        if codes_ref.size(1) < xt.size(1):
+            codes_ref = F.pad(codes_ref, (0, xt.size(1) - codes_ref.size(1)), value=config.datasets.audio_mask_token)
+        elif codes_ref.size(1) > xt.size(1):
+            codes_ref = codes_ref[:, :xt.size(1)]
+
         xt[..., : orig_ref_code_len] = codes_ref[..., : orig_ref_code_len]
 
-        for _ in range(num_corrector_steps):
-            # Use a smaller corrector step (for example, 10% of h)
-            h_corr = dt * 0.1
-            logits_corr = model(xt, text_ids, codes_ref, t_tensor, False, False)
-            p1_corr = torch.softmax(logits_corr, dim=-1)
-            one_hot_x_t_corr = torch.nn.functional.one_hot(xt, num_classes=vocab_size).float()
+        # Optional: Corrector iterations at the current time step
+        # for _ in range(num_corrector_steps):
+        #     # Use a smaller corrector step (for example, 10% of h)
+        #     h_corr = dt * 0.1
+        #     logits_corr = model(xt, text_ids, codes_ref, t_tensor, False, False)
+        #     p1_corr = torch.softmax(logits_corr, dim=-1)
+        #     one_hot_xt_corr = torch.nn.functional.one_hot(xt, num_classes=vocab_size).float()
 
-            # Compute the corrector velocity similarly
-            u_corr = (p1_corr - one_hot_x_t_corr) / (1.0 - t_tensor.item() + 1e-8)
-            new_probs_corr = one_hot_x_t_corr + h_corr * u_corr
-            new_probs_corr = new_probs_corr / new_probs_corr.sum(dim=-1, keepdim=True)
-            xt = torch.distributions.Categorical(probs=new_probs_corr).sample()
+        #     # Compute the corrector velocity similarly
+        #     u_corr = (p1_corr - one_hot_xt_corr) / (1.0 - t_val.item() + 1e-8)
+        #     new_probs_corr = one_hot_xt_corr + h_corr * u_corr
+        #     new_probs_corr = new_probs_corr / new_probs_corr.sum(dim=-1, keepdim=True)
+        #     xt = torch.distributions.Categorical(probs=new_probs_corr).sample()
 
     return xt
 
 
 @torch.no_grad()
 def main() -> None:
-    output_dir = "outputs_pfg_pred_dur_v3"
+    output_dir = "outputs_pfg_dynamic_dur_v2"
     gpu = 0
-    config_path = "/raid/aluno_alef/DFM-TTS-2/config/default_offline_bpe_en.yaml"
-    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/ij9jtdlg/checkpoints/epoch=13-step=240800-val/loss_epoch=3.697.ckpt"
-
-    duration_pred_config_path = "/raid/aluno_alef/DFM-TTS-2/config/duration_predictor_bpe_en.yaml"
-    duration_pred_pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/Duration-Predictor-DFM-TTS/61g87haf/checkpoints/epoch=10-step=138116-val/loss_epoch=4.717.ckpt"
+    config_path = "/raid/aluno_alef/DFM-TTS-2/config/default_offline_bpe_dynamic_dur_en.yaml"
+    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/qvrlk3in/checkpoints/epoch=24-step=422800-val/loss_epoch=3.265.ckpt"
 
     config = OmegaConf.load(config_path)
-    duration_pred_config = OmegaConf.load(duration_pred_config_path)
 
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
 
     tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
     model = DFMTTSWrapper.load_from_checkpoint(pretrained_checkpoint, config=config, map_location=device, strict=False)
     model.eval()
-
-    duration_model = DurationPredictorWrapper.load_from_checkpoint(
-        duration_pred_pretrained_checkpoint,
-        config=duration_pred_config,
-        map_location=device,
-        strict=False
-    )
-    duration_model.eval()
 
     audio_codec = XCodec2Model.from_pretrained(config.datasets.audio_codec).to(device)
     audio_codec.eval()
@@ -265,6 +343,7 @@ def main() -> None:
     # ]
 
     nsf = [128, 256, 512, 1024, 2048]
+    # nsf = [2048]
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -272,16 +351,15 @@ def main() -> None:
         print(f"Processing sentence {idx + 1}/{len(sentences)}")
         for n in tqdm(nsf):
             text_ref = "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
-            # text_ref = None
             x_t = inference(
                 config=config,
                 model=model,
-                duration_model=duration_model,
                 tokenizer=tokenizer,
                 sentence=sentence,
                 nsf=n,
                 text_ref=text_ref,
                 codes_ref=codes_ref,
+                sequence_length=300,
                 device=device
             )
             # remove making tokens from the generated sequence
@@ -294,6 +372,9 @@ def main() -> None:
             x_t = x_t[x_t != config.datasets.audio_pad_token]
             print("3", x_t.shape)
             print(x_t)
+            x_t = x_t[x_t != config.datasets.audio_expand_token]
+            print("Shape after expand removal:", x_t.shape)
+            x_t = x_t[x_t != config.datasets.audio_delete_token]
             x_t = x_t.unsqueeze(0).unsqueeze(0)
             print("4", x_t.shape)
             # Decode the final token sequence into an audio waveform

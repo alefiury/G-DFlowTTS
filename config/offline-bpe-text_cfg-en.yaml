@@ -1,4 +1,4 @@
-title: DFMTTS-LibriTTSR-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-HiFITTS2_5K-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -31,20 +31,21 @@ datasets:
 
     audio_mask_token: 65536
     audio_pad_token: 65537
+    audio_eos_token: 65538
 
-    mask_prob: [0.7, 1.0]
+    mask_prob: [0.0, 1.0]
 
     use_mask: true
-    mask_type: "contiguous"
+    # mask_type: "contiguous"
+    mask_type: "random"
     audio_pad_type: "variable"
 
-    ref_drop_prob: 0.3
-    cond_drop_prob: 0.2
+    ref_drop_prob: 0.0
+    cond_drop_prob: 0.1 # text drop prob
 
     # ref_drop_prob: 0.0
     # cond_drop_prob: 0.0
     assert_drop_prob: true
-
     guidance_scale: 2.5
 
 model:
@@ -55,7 +56,7 @@ model:
     n_heads: 12
     n_blocks: 12
     dropout: 0.1
-    add_token: 2
+    add_token: 3
 
 train:
     batch_size: 32
@@ -66,7 +67,7 @@ optimizer:
     name: "adamw"
     params:
         min_learning_rate: 1e-4
-        learning_rate: 5e-4
+        learning_rate: 3e-4
         eps: 1e-8
         weight_decay: 1e-6
         betas: [0.9, 0.999]
@@ -78,22 +79,22 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    # max_epochs: 100
     max_steps: 500000
-    # max_steps: 1000000
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
-    val_check_interval: 1.0 # Every 1 epoch
+    val_check_interval: 1.0
     accumulate_grad_batches: 4
     precision: bf16
 
 model_checkpoint:
     mode: "min"
+    save_top_k: 2
     save_last: true
     save_weights_only: false
+    every_n_train_steps: 100000
     monitor: "val/loss_epoch"
     dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS"
     filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
