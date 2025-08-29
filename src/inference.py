@@ -97,8 +97,6 @@ def inference(
 
     # Loop over the time grid
     for i in tqdm(range(num_steps), total=num_steps):
-        
-
         t = time_grid[i : i + 1]         # current time, shape [1]
         h = time_grid[i + 1] - time_grid[i]  # step size (scalar)
         # Predictor update: compute model output and update x_t

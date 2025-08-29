@@ -15,17 +15,26 @@ wandb.login()
 def main():
     target_sr = 16000
     model_path = "HKUSTAudio/xcodec2"
-    # output_dir = "/raid/aluno_alef/DATASETS/xcodec2/LibriTTS_R"
-    # base_dir = "/raid/aluno_alef/DATASETS/LibriTTS_R"
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/LibriTTS_R"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/LibriTTS_R"
 
-    output_dir = "/raid/aluno_alef/DATASETS/xcodec2/CML"
-    base_dir = "/raid/aluno_alef/DATASETS/CML"
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/CML"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/CML"
 
-    # output_dir = "/raid/aluno_alef/DATASETS/xcodec2/LJSpeech-1.1"
-    # base_dir = "/raid/aluno_alef/DATASETS/LJSpeech-1.1"
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/LJSpeech-1.1"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/LJSpeech-1.1"
 
-    # output_dir = "/raid/aluno_alef/DATASETS/xcodec2/GigaSpeech"
-    # base_dir = "/raid/aluno_alef/DATASETS/GigaSpeech"
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/GigaSpeech"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/GigaSpeech"
+
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Common_Voice_17_0"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/Common_Voice_17_0"
+
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Emilia-Dataset"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/Emilia-Dataset"
+
+    output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Emilia-Dataset/Emilia-YODAS/JA"
+    base_dir = "/raid/time_voz/DATASETS_TTS/Emilia-Dataset/Emilia-YODAS/JA"
 
     metadata_file = ""
 
@@ -48,7 +57,7 @@ def main():
         filename = os.path.basename(filepath)
         filedir = os.path.dirname(filepath)
         output_filepath = filedir.replace(base_dir, output_dir)
-        output_filepath = os.path.join(output_filepath, filename)[:-4] + ".pt"
+        output_filepath = os.path.join(output_filepath, filename).replace(".wav", ".pt").replace(".flac", ".pt").replace(".mp3", ".pt")
 
         # print(filepath)
         # print(output_filepath)

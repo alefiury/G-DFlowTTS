@@ -1,4 +1,4 @@
-title: DFMTTS-HiFITTS2_5K-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-HiFITTS2_5K-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -48,8 +48,8 @@ datasets:
     assert_drop_prob: true
     guidance_scale: 2.5
 
-    use_eos_as_pad: false
-    loss_on_eos_pad: false
+    use_eos_as_pad: true
+    loss_on_eos_pad: true
 
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
@@ -104,7 +104,7 @@ model_checkpoint:
 
 test:
     log_audio_ref: true
-    nsf: 512
+    nsf: 256
     max_audio_length: 1024
     audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
     text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."

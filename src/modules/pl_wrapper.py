@@ -101,6 +101,9 @@ class DFMTTSWrapper(L.LightningModule):
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
                 audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+                loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
+                pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
             )
         elif self.config.datasets.type == "offline_dynamic_dur":
             print("Creating collate function for offline_dynamic_dur")
@@ -145,6 +148,9 @@ class DFMTTSWrapper(L.LightningModule):
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
                 audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+                loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
+                pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
             )
         elif self.config.datasets.type == "offline_dynamic_dur":
             print("Creating collate function for offline_dynamic_dur")
@@ -336,7 +342,11 @@ class DFMTTSWrapper(L.LightningModule):
             x_1 = self.get_speech_token(input_waveform, input_features)
         elif self.config.datasets.type == "offline" or \
             self.config.datasets.type == "offline_dynamic_dur":
-            x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+            if len(batch) == 6:
+                x_1, transcription_ids, transcription_att_mask, cond, mask, loss_weight_extra = batch
+            else:
+                x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+                loss_weight_extra = None
 
         with torch.no_grad():
             x_0 = cond
@@ -360,9 +370,20 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text=drop_text,
         )
 
-        loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        m  = mask.flatten(0, 1).bool()
         # Apply mask to the loss
-        loss = loss[mask.flatten(0, 1).bool()].mean()
+        # loss = loss[mask.flatten(0, 1).bool()].mean()
+
+        # Apply mask to the loss
+        if loss_weight_extra is not None:
+            w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
+            ce_m = ce[m]
+            w_m = w[m]
+            loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        else:
+            loss = ce[m].mean()
+
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         return loss
@@ -373,7 +394,11 @@ class DFMTTSWrapper(L.LightningModule):
             x_1 = self.get_speech_token(input_waveform, input_features)
         elif self.config.datasets.type == "offline" or \
             self.config.datasets.type == "offline_dynamic_dur":
-            x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+            if len(batch) == 6:
+                x_1, transcription_ids, transcription_att_mask, cond, mask, loss_weight_extra = batch
+            else:
+                x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+                loss_weight_extra = None
 
         with torch.no_grad():
             x_0 = cond
@@ -388,9 +413,23 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text=False,
         )
 
-        loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        # loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        # # Apply mask to the loss
+        # loss = loss[mask.flatten(0, 1).bool()].mean()
+        ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
+        m  = mask.flatten(0, 1).bool()
         # Apply mask to the loss
-        loss = loss[mask.flatten(0, 1).bool()].mean()
+        # loss = loss[mask.flatten(0, 1).bool()].mean()
+
+        # Apply mask to the loss
+        if loss_weight_extra is not None:
+            w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
+            ce_m = ce[m]
+            w_m = w[m]
+            loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        else:
+            loss = ce[m].mean()
+
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         if batch_idx == 0:
@@ -605,7 +644,7 @@ class DFMTTSWrapper(L.LightningModule):
         xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
 
         # create text att_mask, all elements are "true" because we only have one sample
-        text_att_mask = xt.new_ones((1, xt.size(1)), dtype=torch.bool)
+        text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
 
         # Loop over the time grid
         for step in tqdm(range(num_steps), total=num_steps):

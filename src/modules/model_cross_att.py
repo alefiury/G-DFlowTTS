@@ -181,8 +181,7 @@ class MultiHeadCrossAttention(nn.Module):
 
         attn_mask = None
         if key_padding_mask is not None:
-            # SDPA expects True = mask(disallow); ours True = keep => invert
-            attn_mask = (~key_padding_mask)[:, None, None, :]  # (B,1,1,St)
+            attn_mask = key_padding_mask[:, None, None, :] # (B,1,1,St)
 
         out = F.scaled_dot_product_attention(
             q, k, v,
