@@ -96,7 +96,7 @@ class DFMTTSWrapper(L.LightningModule):
                 max_audio_length=self.config.datasets.max_audio_length,
                 mask_prob=self.config.datasets.mask_prob,
                 audio_mask_token=self.config.datasets.audio_mask_token,
-                audio_pad_token=self.config.datasets.audio_pad_token,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
                 audio_eos_token=self.config.datasets.audio_eos_token,
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
@@ -110,9 +110,9 @@ class DFMTTSWrapper(L.LightningModule):
             collate_fn = OfflineMultipleSpeakerDreamOnCollateFunc(
                 max_audio_length=self.config.datasets.max_audio_length,
                 audio_mask_token=self.config.datasets.audio_mask_token,
-                audio_pad_token=self.config.datasets.audio_pad_token,
-                audio_expand_token=self.config.datasets.audio_expand_token,
-                audio_delete_token=self.config.datasets.audio_delete_token,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_expand_token=getattr(self.config.datasets, "audio_expand_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
                 mask_prob=self.config.datasets.mask_prob,
@@ -121,7 +121,11 @@ class DFMTTSWrapper(L.LightningModule):
                 mix_ratio=self.config.datasets.mix_ratio,
                 p_merge_static=self.config.datasets.p_merge_static,
                 p_merge_dynamic_scale=self.config.datasets.p_merge_dynamic_scale,
-                delete_frac_range=self.config.datasets.delete_frac_range
+                delete_frac_range=self.config.datasets.delete_frac_range,
+                # padding params
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+                loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
+                pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
             )
         else:
             raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
@@ -143,7 +147,7 @@ class DFMTTSWrapper(L.LightningModule):
                 max_audio_length=self.config.datasets.max_audio_length,
                 mask_prob=self.config.datasets.mask_prob,
                 audio_mask_token=self.config.datasets.audio_mask_token,
-                audio_pad_token=self.config.datasets.audio_pad_token,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
                 audio_eos_token=self.config.datasets.audio_eos_token,
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
@@ -157,9 +161,9 @@ class DFMTTSWrapper(L.LightningModule):
             collate_fn = OfflineMultipleSpeakerDreamOnCollateFunc(
                 max_audio_length=self.config.datasets.max_audio_length,
                 audio_mask_token=self.config.datasets.audio_mask_token,
-                audio_pad_token=self.config.datasets.audio_pad_token,
-                audio_expand_token=self.config.datasets.audio_expand_token,
-                audio_delete_token=self.config.datasets.audio_delete_token,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_expand_token=getattr(self.config.datasets, "audio_expand_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 text_pad_token=self.config.datasets.text_pad_token,
                 mask_type=self.config.datasets.mask_type,
                 mask_prob=self.config.datasets.mask_prob,
@@ -168,7 +172,11 @@ class DFMTTSWrapper(L.LightningModule):
                 mix_ratio=self.config.datasets.mix_ratio,
                 p_merge_static=self.config.datasets.p_merge_static,
                 p_merge_dynamic_scale=self.config.datasets.p_merge_dynamic_scale,
-                delete_frac_range=self.config.datasets.delete_frac_range
+                delete_frac_range=self.config.datasets.delete_frac_range,
+                # padding params
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+                loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
+                pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
             )
         else:
             raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
@@ -372,8 +380,6 @@ class DFMTTSWrapper(L.LightningModule):
 
         ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
         m  = mask.flatten(0, 1).bool()
-        # Apply mask to the loss
-        # loss = loss[mask.flatten(0, 1).bool()].mean()
 
         # Apply mask to the loss
         if loss_weight_extra is not None:
@@ -413,14 +419,8 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text=False,
         )
 
-        # loss = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
-        # # Apply mask to the loss
-        # loss = loss[mask.flatten(0, 1).bool()].mean()
         ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
         m  = mask.flatten(0, 1).bool()
-        # Apply mask to the loss
-        # loss = loss[mask.flatten(0, 1).bool()].mean()
-
         # Apply mask to the loss
         if loss_weight_extra is not None:
             w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
@@ -448,9 +448,6 @@ class DFMTTSWrapper(L.LightningModule):
 
         audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec).to(self.device)
         audio_ref, audio_ref_sr = torchaudio.load(audio_ref_path)
-        # audio_ref = audio_ref.to(self.device)
-
-        print(f"Audio reference shape: {audio_ref.shape}")
 
         if audio_ref_sr != self.config.datasets.sampling_rate:
             audio_ref = torchaudio.transforms.Resample(audio_ref_sr, self.config.datasets.sampling_rate)(audio_ref)
@@ -482,8 +479,7 @@ class DFMTTSWrapper(L.LightningModule):
         for idx, sentence in tqdm(enumerate(self.config.test.sentences), total=len(self.config.test.sentences)):
             print(f"\nGenerating audio for sentence: {sentence}")
             augmented_sentence = text_ref + " " + sentence
-            print(f"Augmented sentence: {augmented_sentence}")
-            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="pt-br")).to(self.device).unsqueeze(0)
+            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en-us")).to(self.device).unsqueeze(0)
             print(f"Text IDs: {text_ids.shape}", torch.min(text_ids), torch.max(text_ids))
             # Initialize xt with mask token (batch size = 1)
             x_t = self.source_distribution.sample((1, max_length), device=self.device)
@@ -492,19 +488,26 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"Initial codes_ref: {codes_ref.shape}, {torch.min(codes_ref)}, {torch.max(codes_ref)}")
             print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
 
-            x_t = self.generate_sample(
-                xt=x_t,
-                text_ids=text_ids,
-                codes_ref=codes_ref,
-                nsf=self.config.test.nsf,
-                codes_ref_size=codes_ref_size
-            )
-            # Decode the final token sequence into an audio waveform
-            if self.config.datasets.type == "dynamic":
-                generated_audio = self.audio_codec.decode_code(x_t)
-            elif self.config.datasets.type == "offline" or \
-                self.config.datasets.type == "offline_dynamic_dur":
-                generated_audio = audio_codec.decode_code(x_t)
+            if self.config.datasets.ref_drop_prob==0 and \
+                self.config.datasets.cond_drop_prob==0:
+                print("\n\tUsing simple_generate_sample\n")
+                x_t = self.simple_generate_sample(
+                    xt=x_t,
+                    text_ids=text_ids,
+                    codes_ref=codes_ref,
+                    nsf=self.config.test.nsf,
+                    codes_ref_size=codes_ref_size
+                )
+            else:
+                print("\n\tUsing PFG generator\n")
+                x_t = self.generate_sample(
+                    xt=x_t,
+                    text_ids=text_ids,
+                    codes_ref=codes_ref,
+                    nsf=self.config.test.nsf,
+                    codes_ref_size=codes_ref_size
+                )
+            generated_audio = audio_codec.decode_code(x_t)
             # Use a truncated version of the sentence for the log key (replace spaces with underscores)
             key = f"generated_audio_{idx}"
             generated_audios[key] = wandb.Audio(
@@ -514,45 +517,65 @@ class DFMTTSWrapper(L.LightningModule):
             )
         wandb.log(generated_audios)
 
-    def old_generate_sample(self, x_t, text_ids, codes_ref, nsf):
-        num_steps = self.config.test.nsf
-        eps = 1e-9
-        t_init = 0.0
-        t_final = 1.0
-        time_grid = torch.linspace(t_init, t_final, num_steps + 1, device=self.device)
+    def simple_generate_sample(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+        num_steps = nsf
+        dt = 1.0 / num_steps
+        x1_temp = 1.0
+        gamma = 2.5
+        mask_token_id = self.config.datasets.audio_mask_token
+        S = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        eps = 1e-12
+        noise = 0.0
 
-        # Run the flow-matching inference loop
-        for i in tqdm(range(num_steps), total=num_steps):
-            t = time_grid[i : i + 1]         # current time, shape [1]
-            h = time_grid[i + 1] - time_grid[i]  # step size (scalar)
+        mask_one_hot = torch.zeros((S), device=self.device)
+        mask_one_hot[mask_token_id] = 1.0
+
+        xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
+
+        # create text att_mask, all elements are "true" because we only have one sample
+        text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
+
+        # Loop over the time grid
+        for step in tqdm(range(num_steps), total=num_steps):
+            t_val    = step * dt
+            t_tensor = xt.new_full((1,), t_val, dtype=torch.float32, device=self.device)
+            # print(f"\n\n\t SIZE S: {S} | {xt.shape} | {torch.min(xt)}, {torch.max(xt)}")
+            assert torch.min(xt) >= 0 and torch.max(xt) < S, f"xt values should be in [0, {S}), but got min {torch.min(xt)} and max {torch.max(xt)}"
             # Get Conditional Logits
             logits = self(
-                x_t=x_t,
+                x_t=xt,
                 text_ids=text_ids,
-                cond_ids=codes_ref,
-                time=t,
-                drop_text=False,
-                drop_cond=False,
+                text_att_mask=text_att_mask,
+                time=t_tensor,
+                drop_text=False
             )
+            if logits.size(-1) != S:
+                raise RuntimeError(f"logits classes {logits.size(-1)} != V_total {S}")
+            # Safety: xt must be < S for one_hot
+            if xt.max() >= S or xt.min() < 0:
+                badmax = int(xt.max().item()); badmin = int(xt.min().item())
+                raise RuntimeError(f"xt out of [0,{S-1}]: min={badmin} max={badmax}")
             p1 = torch.softmax(logits, dim=-1)
-            one_hot_x_t = torch.nn.functional.one_hot(x_t, num_classes=vocab_size).float()
+            one_hot_x_t = torch.nn.functional.one_hot(xt, num_classes=S).float()
             # Compute the velocity update using the denoiser formulation
             # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
-            u = (p1 - one_hot_x_t) / (1.0 - t.item() + eps)
+            u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
             # Euler update: compute new probabilities and sample the updated state
-            new_probs = one_hot_x_t + h * u
+            new_probs = one_hot_x_t + dt * u
             new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
-            x_t = torch.distributions.Categorical(probs=new_probs).sample()
+            xt = torch.distributions.Categorical(probs=new_probs).sample()
         # remove making tokens from the generated sequence
-        x_t = x_t.squeeze(0)
-        print("Shape after squeeze:", x_t.shape)
-        x_t = x_t[x_t != self.config.datasets.audio_mask_token]
-        print("Shape after mask removal:", x_t.shape)
-        # remove padding tokens from the generated sequence
-        x_t = x_t[x_t != self.config.datasets.audio_pad_token]
-        print("Shape after pad removal:", x_t.shape)
-        x_t = x_t.unsqueeze(0).unsqueeze(0)
-        print("Final Shape", x_t.shape)
+        xt = xt.squeeze(0)
+        xt = xt[xt != self.config.datasets.audio_mask_token]
+        if hasattr(self.config.datasets, "audio_eos_token"):
+            xt = xt[xt != self.config.datasets.audio_eos_token]
+        # check if audio_pad_token exist in self.config.datasets
+        if hasattr(self.config.datasets, "audio_pad_token"):
+            # remove padding tokens from the generated sequence
+            xt = xt[xt != self.config.datasets.audio_pad_token]
+        xt = xt.unsqueeze(0).unsqueeze(0)
+
+        return xt
 
     def apply_vlg_ops(
         self,
@@ -601,13 +624,13 @@ class DFMTTSWrapper(L.LightningModule):
 
                 # DELETE: drop left real neighbor + the DELETE itself
                 if t == delete_token:
-                    # find a real (non-sentinel) left neighbor inside the editable window *or* in prefix
-                    j = len(new_seq) - 1
-                    while j >= 0 and new_seq[j] in SENTINELS:
-                        j -= 1
-                    if j >= 0:
-                        new_seq.pop(j)   # remove the real token
-                    # skip the DELETE itself by not appending it
+                    # # find a real (non-sentinel) left neighbor inside the editable window *or* in prefix
+                    # j = len(new_seq) - 1
+                    # while j >= 0 and new_seq[j] in SENTINELS:
+                    #     j -= 1
+                    # if j >= 0:
+                    #     new_seq.pop(j)   # remove the real token
+                    # # skip the DELETE itself by not appending it
                     i += 1
                     continue
 
@@ -649,7 +672,7 @@ class DFMTTSWrapper(L.LightningModule):
         # Loop over the time grid
         for step in tqdm(range(num_steps), total=num_steps):
             t_val    = step * dt
-            t_tensor = xt.new_full((1,), t_val)
+            t_tensor = xt.new_full((1,), t_val, dtype=torch.float32, device=self.device)
 
             # unconditional pass
             logits_u = self(
@@ -700,7 +723,8 @@ class DFMTTSWrapper(L.LightningModule):
                     x=xt,
                     mask_token=self.config.datasets.audio_mask_token,
                     expand_token=self.config.datasets.audio_expand_token,
-                    delete_token=self.config.datasets.audio_delete_token,
+                    # delete_token=self.config.datasets.audio_delete_token,
+                    delete_token=self.config.datasets.audio_eos_token,
                     max_len=self.config.test.max_audio_length,
                     edit_start=codes_ref_size,
                     edit_end=None
@@ -728,8 +752,23 @@ class DFMTTSWrapper(L.LightningModule):
         print(f"Shape after eos removal:", xt.shape)
         xt = xt[xt != self.config.datasets.audio_mask_token]
         print("Shape after mask removal:", xt.shape)
+
         # remove padding tokens from the generated sequence
-        xt = xt[xt != self.config.datasets.audio_pad_token]
+        if hasattr(self.config.datasets, "audio_pad_token"):
+            # remove padding tokens from the generated sequence
+            xt = xt[xt != self.config.datasets.audio_pad_token]
+            print("Shape after pad removal:", xt.shape)
+
+        if hasattr(self.config.datasets, "audio_expand_token"):
+            # remove padding tokens from the generated sequence
+            xt = xt[xt != self.config.datasets.audio_expand_token]
+            print("Shape after expand removal:", xt.shape)
+
+        if hasattr(self.config.datasets, "audio_delete_token"):
+            # remove padding tokens from the generated sequence
+            xt = xt[xt != self.config.datasets.audio_delete_token]
+            print("Shape after delete removal:", xt.shape)
+
         print("Shape after pad removal:", xt.shape)
         if self.config.datasets.type == "offline_dynamic_dur":
             xt = xt[xt != self.config.datasets.audio_expand_token]

@@ -159,7 +159,7 @@ def inference(
     # Loop over the time grid
     for step in range(num_steps):
         t_val    = step * dt
-        t_tensor = xt.new_full((1,), t_val)
+        t_tensor = xt.new_full((1,), t_val, dtype=torch.float32)
 
         # unconditional pass
         logits_u = model(
@@ -225,7 +225,7 @@ def inference(
 
 @torch.no_grad()
 def main() -> None:
-    output_dir = "outputs_pfg_pred_dur_cross_att_eos_v5"
+    output_dir = "outputs_pfg_pred_dur_cross_att_eos_v5-whaaaaaaaaaaats"
     gpu = 0
     config_path = "/raid/aluno_alef/DFM-TTS-2/config/cross_att_offline_bpe-text_cfg-en.yaml"
     pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/e6a4774g/checkpoints/epoch=23-step=400000-val/loss_epoch=3.467.ckpt"

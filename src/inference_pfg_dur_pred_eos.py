@@ -77,8 +77,8 @@ def inference(
         augmented_sentence = text_ref + ". " + sentence
     else:
         augmented_sentence = sentence
-    # text_ids = tokenizer.encode(augmented_sentence, lang="en-us")
-    text_ids = tokenizer.encode(augmented_sentence, lang="pt-br")
+    text_ids = tokenizer.encode(augmented_sentence, lang="en-us")
+    # text_ids = tokenizer.encode(augmented_sentence, lang="pt-br")
 
     text_ids = torch.tensor(text_ids).unsqueeze(0).to(device)
     max_length = config.datasets.max_audio_length
@@ -135,11 +135,11 @@ def inference(
     x1_temp = 1.0
     guidance_scale = config.datasets.guidance_scale
     # gamma = config.datasets.guidance_scale
-    gamma = 2.0
+    gamma = 2.5
     mask_token_id = config.datasets.audio_mask_token
     S = vocab_size
     eps = 1e-9
-    noise = 0.2
+    noise = 0.0
 
     mask_one_hot = torch.zeros((S), device=model.device)
     mask_one_hot[mask_token_id] = 1.0
@@ -159,7 +159,7 @@ def inference(
     # Loop over the time grid
     for step in range(num_steps):
         t_val    = step * dt
-        t_tensor = xt.new_full((1,), t_val)
+        t_tensor = xt.new_full((1,), t_val, dtype=torch.float32)
 
         # unconditional pass
         logits_u = model(
@@ -225,7 +225,7 @@ def inference(
 
 @torch.no_grad()
 def main() -> None:
-    output_dir = "outputs_pfg_pred_dur_eos"
+    output_dir = "outputs_pfg_pred_dur_eos_nowwhatmotherfucker"
     gpu = 0
     config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-en.yaml"
     pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/m1ejk3am/checkpoints/epoch=29-step=500000-val/loss_epoch=3.366.ckpt"

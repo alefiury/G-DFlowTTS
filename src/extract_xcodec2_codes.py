@@ -21,6 +21,9 @@ def main():
     # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/CML"
     # base_dir = "/raid/time_voz/DATASETS_TTS/CML"
 
+    output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/hi_fi_tts_v0"
+    base_dir = "/raid/time_voz/DATASETS_TTS/hi_fi_tts_v0"
+
     # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/LJSpeech-1.1"
     # base_dir = "/raid/time_voz/DATASETS_TTS/LJSpeech-1.1"
 
@@ -30,11 +33,14 @@ def main():
     # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Common_Voice_17_0"
     # base_dir = "/raid/time_voz/DATASETS_TTS/Common_Voice_17_0"
 
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Common_Voice_17_0/audio/it"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/Common_Voice_17_0/audio/it"
+
     # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Emilia-Dataset"
     # base_dir = "/raid/time_voz/DATASETS_TTS/Emilia-Dataset"
 
-    output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Emilia-Dataset/Emilia-YODAS/JA"
-    base_dir = "/raid/time_voz/DATASETS_TTS/Emilia-Dataset/Emilia-YODAS/JA"
+    # output_dir = "/raid/time_voz/DATASETS_TTS/xcodec2/Emilia-Dataset/Emilia-YODAS/JA"
+    # base_dir = "/raid/time_voz/DATASETS_TTS/Emilia-Dataset/Emilia-YODAS/JA"
 
     metadata_file = ""
 

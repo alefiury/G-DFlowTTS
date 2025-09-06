@@ -563,10 +563,10 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
     def __init__(
         self,
         max_audio_length: int = 2048,
-        audio_mask_token: int = 65536,
-        audio_pad_token: int = 65537,
-        audio_expand_token: int = 65538,
-        audio_eos_token: int = 65539,
+        audio_mask_token: int = None,
+        audio_pad_token: int = None,
+        audio_expand_token: int = None,
+        audio_eos_token: int = None,
         text_pad_token: int = 0,
         mask_type: str = "contiguous",
         mask_prob: Tuple[float, float] = (0.7, 1.0),
@@ -577,6 +577,10 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
         p_merge_dynamic_scale: float = 0.5,
         delete_frac_range: tuple = (0.0, 0.10),  # how many EOS-in-middle to insert (fraction of current length)
         delete_loss_weight: float = 0.5,
+        # padding params
+        use_eos_as_pad: bool = False,
+        loss_on_eos_pad: bool = False,
+        pad_loss_weight: float = 1.0,
     ):
         self.max_audio_length = max_audio_length
         self.audio_mask_token = audio_mask_token
@@ -594,6 +598,17 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
         self.delete_frac_range = delete_frac_range
         self.delete_loss_weight = delete_loss_weight
 
+        self.use_eos_as_pad = use_eos_as_pad
+        self.loss_on_eos_pad = loss_on_eos_pad
+        assert 0.0 <= pad_loss_weight <= 1.0, f"Invalid pad_loss_weight: {pad_loss_weight}"
+        self.pad_loss_weight = pad_loss_weight
+        if self.use_eos_as_pad:
+            print("\n\tUsing EOS token as padding!!!\n")
+        if self.loss_on_eos_pad:
+            print("\n\tComputing loss on EOS padding tokens!!!\n")
+        if self.pad_loss_weight != 1.0:
+            print(f"\n\tUsing pad loss weight: {self.pad_loss_weight}!!!\n")
+
     def _pad_1d(self, x: torch.Tensor, L: int, value: int) -> torch.Tensor:
         out = x.new_full((L,), value)
         Lx = min(L, x.numel())
@@ -610,7 +625,9 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
         x = x[:core_max]
         x = torch.cat([x, x.new_tensor([self.audio_eos_token])], dim=0)
         if x.numel() < L:
-            x = torch.cat([x, x.new_full((L - x.numel(),), self.audio_pad_token)], dim=0)
+            # x = torch.cat([x, x.new_full((L - x.numel(),), self.audio_pad_token)], dim=0)
+            effective_pad_id = self.audio_eos_token if self.use_eos_as_pad else self.audio_pad_token
+            x = torch.cat([x, x.new_full((L - x.numel(),), effective_pad_id)], dim=0)
         return x
 
     def _find_spans(self, mask_bool: torch.Tensor):
@@ -628,7 +645,7 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
                 spans.append((start, i))  # [start, end)
         return spans
 
-    def _mask_audio_random_or_contiguous(self, audio: torch.Tensor):
+    def _mask_audio_random_or_contiguous(self, audio: torch.Tensor, audio_att_mask: torch.Tensor):
         """
         Per-sequence masking (each sequence samples its own p in [min,max]).
         Returns a boolean mask of which positions are masked.
@@ -639,16 +656,20 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
         p_min, p_max = self.mask_prob
         p = torch.empty(1, device=audio.device).uniform_(p_min, p_max).item()
 
+        if self.use_eos_as_pad and self.loss_on_eos_pad:
+            valid = torch.ones(L, dtype=torch.bool, device=audio.device)
+        else:
+            valid = audio_att_mask.bool()
+
         if self.mask_type == "contiguous":
-            valid = (audio != self.audio_pad_token).nonzero(as_tuple=False).squeeze(-1)
+            valid_idx = valid.nonzero(as_tuple=False).squeeze(-1)
             if valid.numel() > 0:
                 valid_L = valid.numel()
                 block_len = max(1, int(valid_L * p))
                 start = torch.randint(0, max(1, valid_L - block_len + 1), (1,), device=audio.device).item()
-                idx = valid[start : start + block_len]
+                idx = valid_idx[start : start + block_len]
                 mask_bool[idx] = True
         else:
-            valid = (audio != self.audio_pad_token)
             rand = torch.rand_like(audio, dtype=torch.float)
             mask_bool = (rand < p) & valid
 
@@ -705,10 +726,9 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
 
         # avoid placing EOS right after sentinels or on PAD/MASK/EXPAND/EOS
         SENTINELS = {
-            self.audio_pad_token,
             self.audio_mask_token,
             self.audio_expand_token,
-            self.audio_eos_token,  # don’t chain EOS
+            self.audio_eos_token,
         }
 
         eligible = []
@@ -771,14 +791,23 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
             raise ValueError(f"Unknown audio_pad_type: {self.audio_pad_type}")
 
         z0_list, inp_list, m_list = [], [], []
+        lengths_with_eos = []
+
         for audio in audio_codes:
             a = audio.clone().long().view(-1)
+            # length used to build attn mask later (len content + EOS)
+            core_len = min(max_L - 1, a.numel())
+            lengths_with_eos.append(core_len + 1)
 
             # (0) append EOS then PAD to max_L
             a = self._append_eos_then_pad(a, max_L)              # shape [max_L]
 
+            # Build per-seq audio_att_mask: True up to content+EOS, False after
+            arangeL = torch.arange(max_L, device=a.device)
+            audio_att_mask_i = (arangeL < (core_len + 1))  # bool
+
             # (1) pick mask set (per-sequence probability)
-            mask_bool = self._mask_audio_random_or_contiguous(a)
+            mask_bool = self._mask_audio_random_or_contiguous(a, audio_att_mask_i)
 
             # (2) z0: start from original tokens (a), merge masked spans -> <EXPAND>
             z0_tokens, z0_mask = self._merge_masks_into_expand(a.tolist(), mask_bool)
@@ -795,13 +824,25 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
             inp_tokens = inp_tokens[:Lcap]
             loss_mask  = loss_mask[:Lcap]
 
-            z0_list.append(self._pad_1d(torch.as_tensor(z0_tokens, dtype=torch.long, device=a.device), max_L, self.audio_pad_token))
-            inp_list.append(self._pad_1d(torch.as_tensor(inp_tokens, dtype=torch.long, device=a.device), max_L, self.audio_pad_token))
+            effective_pad_id = self.audio_eos_token if self.use_eos_as_pad else self.audio_pad_token
+            z0_list.append(self._pad_1d(torch.as_tensor(z0_tokens, dtype=torch.long, device=a.device), max_L, effective_pad_id))
+            inp_list.append(self._pad_1d(torch.as_tensor(inp_tokens, dtype=torch.long, device=a.device), max_L, effective_pad_id))
             m_list.append(self._pad_1d(loss_mask.to(torch.long), max_L, 0).bool())
 
         z0_padded    = torch.stack(z0_list, dim=0)
         input_padded = torch.stack(inp_list, dim=0)
         loss_mask    = torch.stack(m_list,  dim=0)
+
+        # --- Batch audio attention mask (for loss weighting like MaskCollate) ---
+        lengths_with_eos_t = torch.tensor(lengths_with_eos, device=z0_padded.device, dtype=torch.long)
+        arangeL = torch.arange(max_L, device=z0_padded.device).unsqueeze(0)  # [1, L]
+        audio_att_mask = (arangeL < lengths_with_eos_t.unsqueeze(1))         # [B, L] bool
+
+        if self.use_eos_as_pad and self.loss_on_eos_pad and self.pad_loss_weight < 1.0:
+            loss_weight = torch.ones_like(z0_padded, dtype=torch.float32)
+            loss_weight[~audio_att_mask] = self.pad_loss_weight
+        else:
+            loss_weight = None
 
         # --- Text padding + attention mask ---
         transcription_padded = pad_sequence(
@@ -811,9 +852,7 @@ class OfflineMultipleSpeakerDreamOnCollateFunc:
         )
         transcription_attention_mask = (transcription_padded != self.text_pad_token)  # bool
 
-        # RETURN ORDER (now includes text attn mask):
-        # x_1=z0_padded, text, text_attn_mask, cond=input_padded, loss_mask
-        return z0_padded, transcription_padded, transcription_attention_mask, input_padded, loss_mask
+        return z0_padded, transcription_padded, transcription_attention_mask, input_padded, loss_mask, loss_weight
 
 
 @torch.no_grad()
