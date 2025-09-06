@@ -14,7 +14,9 @@ Duration-Predictor-DFM-TTS/
 outputs*/
 outputs_pfg/
 checkpoints/
+*.mp3
 *.wav
+*.flac
 *.ckpt
 
 # Distribution / packaging
