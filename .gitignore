@@ -17,6 +17,7 @@ checkpoints/
 *.mp3
 *.wav
 *.flac
+*.ogg
 *.ckpt
 
 # Distribution / packaging
