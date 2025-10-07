@@ -90,16 +90,25 @@ def inference(
     codes_ref: Tensor = None,
     sequence_length: int = 300,
     device: torch.device = torch.device("cuda"),
-    x1_temp: float = 1.0,
-    noise: float = 0.0,
-    guidance_scale: float = 2.5,
-    alpha_strength: float = 12.0,
+    x1_temp: float = 0.8,
+    noise: float = 0.3,
+    guidance_scale: float = 2.0,
+    alpha_strength: float = 20.0,
+    ref_language: str = "pt",
+    text_language: str = "pt"
 ) -> Tensor:
     # misc numerics
     eps = 1e-12
     # --- text ids ---
-    augmented_sentence = (text_ref + ". " + sentence) if text_ref is not None else sentence
-    text_ids = torch.tensor(tokenizer.encode(augmented_sentence, lang="pt")).unsqueeze(0).to(device)
+    # augmented_sentence = (text_ref + ". " + sentence) if text_ref is not None else sentence
+    # text_ids = torch.tensor(tokenizer.encode(augmented_sentence, lang=language)).unsqueeze(0).to(device)
+
+    text_ids_ref = tokenizer.encode(text_ref, lang=ref_language)
+    text_ids_text = tokenizer.encode(sentence, lang=text_language)
+
+    print(text_ids_ref[:-1], text_ids_text)
+
+    text_ids = torch.tensor(text_ids_ref[:-1] + text_ids_text).unsqueeze(0).to(device)
 
     max_length = config.datasets.max_audio_length
     vocab_size = config.datasets.audio_vocab_size + config.model.add_token
@@ -232,7 +241,7 @@ def inference(
 
 @torch.no_grad()
 def main() -> None:
-    output_dir = "fkpl1tsp-multilingual-bpe-pfg-pt-eos_as_pad-pad_as_loss-cubic-corrector"
+    output_dir = "w1kigq88-multilingual-bpe-pfg-pt-eos_as_pad-pad_as_loss-cubic-corrector"
     # libri_speech_test_clean_metadata = "/raid/aluno_alef/DATASETS/LibriTTS_R-test-clean.csv"
 
     # df = pd.read_csv(libri_speech_test_clean_metadata)
@@ -246,7 +255,7 @@ def main() -> None:
     gpu = 0
 
     config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-eos_as_pad-multilingual.yaml"
-    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/fkpl1tsp/checkpoints/epoch=08-step=300000-val/loss_epoch=1.647.ckpt"
+    pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/w1kigq88/checkpoints/epoch=08-step=300000-val/loss_epoch=1.615.ckpt"
 
     config = OmegaConf.load(config_path)
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
@@ -258,15 +267,51 @@ def main() -> None:
     audio_codec = XCodec2Model.from_pretrained(config.datasets.audio_codec).to(device)
     audio_codec.eval()
 
-    nsf = [16, 32, 64, 128, 256, 512, 1024, 2048]
+    nsf = [512, 1024]
 
     os.makedirs(output_dir, exist_ok=True)
 
-    text = "Embora estivesse chovendo, eles decidiram passear na floresta."
+    sentences = [
+        ("pt", "Embora estivesse chovendo, eles decidiram passear na floresta."),
+        ("pt", "Por causa do trânsito intenso, chegamos à reunião um pouco atrasados."),
+        ("pt", "Mesmo se sentindo cansada, ela continuou a trabalhar em seu projeto até tarde da noite."),
+        ("pt", "Se você quer ter sucesso, deve estar preparado para trabalhar muito duro e manter o foco."),
+        ("pt", "Antes de sair de férias, lembre-se de regar as plantas e trancar todas as portas."),
+
+        ("en", "Although it was raining, they decided to go for a walk in the forest."),
+        ("en", "Because of the heavy traffic, we arrived at the meeting slightly late."),
+        ("en", "Even though she felt tired, she continued to work on her project until late night."),
+        ("en", "If you want to succeed, you must be prepared to work very hard and stay focused."),
+        ("en", "Before leaving for vacation, remember to water the plants and lock all the doors."),
+
+        ("it", "Sebbene piovesse, hanno deciso di fare una passeggiata nella foresta."),
+        ("it", "A causa del traffico intenso, siamo arrivati alla riunione leggermente in ritardo."),
+        ("it", "Anche se si sentiva stanca, ha continuato a lavorare al suo progetto fino a tarda notte."),
+        ("it", "Se vuoi avere successo, devi essere pronto a lavorare molto duramente e rimanere concentrato."),
+        ("it", "Prima di partire per le vacanze, ricordati di innaffiare le piante e chiudere a chiave tutte le porte."),
+
+        ("pl", "Chociaż padało, postanowili wybrać się na spacer po lesie."),
+        ("pl", "Z powodu dużego natężenia ruchu drogowego dotarliśmy na spotkanie nieco spóźnieni."),
+        ("pl", "Mimo że była zmęczona, pracowała nad swoim projektem do późna w nocy."),
+        ("pl", "Jeśli chcesz odnieść sukces, musisz być gotowy ciężko pracować i pozostać skupionym."),
+        ("pl", "Przed wyjazdem na wakacje pamiętaj, by podlać rośliny i zamknąć wszystkie drzwi na klucz."),
+
+        ("es", "Aunque llovía, decidieron dar un paseo por el bosque."),
+        ("es", "Debido al intenso tráfico, llegamos un poco tarde a la reunión."),
+        ("es", "A pesar de que se sentía cansada, siguió trabajando en su proyecto hasta altas horas de la noche."),
+        ("es", "Si quieres tener éxito, debes estar dispuesto a trabajar muy duro y mantener la concentración."),
+        ("es", "Antes de salir de vacaciones, recuerda regar las plantas y cerrar con llave todas las puertas."),
+
+        ("fr", "Malgré la pluie, ils ont décidé de faire une promenade en forêt."),
+        ("fr", "À cause de la circulation dense, nous sommes arrivés légèrement en retard à la réunion."),
+        ("fr", "Même si elle était fatiguée, elle a continué à travailler sur son projet jusqu’à tard dans la nuit."),
+        ("fr", "Si tu veux réussir, tu dois être prêt à travailler très dur et à rester concentré."),
+        ("fr", "Avant de partir en vacances, n’oublie pas d’arroser les plantes et de fermer toutes les portes à clé."),
+    ]
     text_ref = "A união faz a força, já dizia minha avó. E quando a gente se junta para resolver os problemas do bairro, as coisas fluem melhor."
     ref_filepath = "ermis_11labs-0000-0003.wav"
 
-    print(f"Processing {text}")
+    # print(f"Processing {text}")
 
     audio_ref, audio_ref_sr = torchaudio.load(ref_filepath)
     if audio_ref_sr != 16000:
@@ -276,32 +321,35 @@ def main() -> None:
     # save audio ref
     # torchaudio.save(f"{output_dir}/audio_ref_{idx}.mp3", audio_ref.cpu(), 16000)
 
-    for n in tqdm(nsf):
-        x_t = inference(
-            config=config,
-            model=model,
-            duration_model=None,
-            tokenizer=tokenizer,
-            sentence=text,
-            nsf=n,
-            text_ref=text_ref,
-            codes_ref=codes_ref,
-            sequence_length=512,
-            device=device
-        )
-        # remove making tokens from the generated sequence
-        x_t = x_t.squeeze(0)
-        x_t = x_t[codes_ref.size(0):]
+    for idx, (language, text) in tqdm(enumerate(sentences), total=len(sentences)):
+        for n in tqdm(nsf):
+            x_t = inference(
+                config=config,
+                model=model,
+                duration_model=None,
+                tokenizer=tokenizer,
+                sentence=text,
+                nsf=n,
+                text_ref=text_ref,
+                codes_ref=codes_ref,
+                sequence_length=512,
+                device=device,
+                ref_language="pt",
+                text_language=language
+            )
+            # remove making tokens from the generated sequence
+            x_t = x_t.squeeze(0)
+            x_t = x_t[codes_ref.size(0):]
 
-        x_t = x_t[x_t != config.datasets.audio_eos_token]
-        x_t = x_t[x_t != config.datasets.audio_mask_token]
-        # remove padding tokens from the generated sequence
-        if hasattr(config.datasets, "audio_pad_token"):
-            x_t = x_t[x_t != config.datasets.audio_pad_token]
-        x_t = x_t.unsqueeze(0).unsqueeze(0)
-        # Decode the final token sequence into an audio waveform
-        generated_audio = audio_codec.decode_code(x_t)
-        torchaudio.save(f"{output_dir}/audio_{n}.wav", generated_audio.squeeze(0).cpu(), 16000)
+            x_t = x_t[x_t != config.datasets.audio_eos_token]
+            x_t = x_t[x_t != config.datasets.audio_mask_token]
+            # remove padding tokens from the generated sequence
+            if hasattr(config.datasets, "audio_pad_token"):
+                x_t = x_t[x_t != config.datasets.audio_pad_token]
+            x_t = x_t.unsqueeze(0).unsqueeze(0)
+            # Decode the final token sequence into an audio waveform
+            generated_audio = audio_codec.decode_code(x_t)
+            torchaudio.save(f"{output_dir}/{idx}_audio_{n}.wav", generated_audio.squeeze(0).cpu(), 16000)
 
 
 if __name__ == "__main__":

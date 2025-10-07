@@ -30,6 +30,7 @@ from utils.lr_schedulers import CosineWarmupLR, LinearLR
 from modules.flow import (
     MixtureDiscreteProbPath,
     PolynomialConvexScheduler,
+    KineticOptimalMixtureScheduler,
     MaskedSourceDistribution,
     UniformSourceDistribution
 )
@@ -48,6 +49,11 @@ class DFMTTSWrapper(L.LightningModule):
         super().__init__()
         self.config = config
 
+        # --- Loss config (default = plain CE) ---
+        self.loss_name = getattr(getattr(config, "loss", None), "name", "ce").lower()
+        # self.lambda_clip = float(getattr(getattr(config, "loss", None), "lambda_clip", 50.0))
+        # self.lambda_normalize = bool(getattr(getattr(config, "loss", None), "normalize", True))
+
         if self.config.source_dist_type == "uniform":
             self.source_distribution = UniformSourceDistribution(
                 vocab_size=self.config.datasets.audio_vocab_size
@@ -59,9 +65,14 @@ class DFMTTSWrapper(L.LightningModule):
         else:
             raise ValueError(f"Invalid source distribution: {self.config.source_dist_type}")
 
-        self.path = MixtureDiscreteProbPath(
-            scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
-        )
+        if getattr(self.config, "kop_scheduler", False):
+            self.path = MixtureDiscreteProbPath(
+                scheduler=KineticOptimalMixtureScheduler()
+            )
+        else:
+            self.path = MixtureDiscreteProbPath(
+                scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
+            )
 
         self.criteria = torch.nn.CrossEntropyLoss(reduction="none")
 
@@ -74,6 +85,36 @@ class DFMTTSWrapper(L.LightningModule):
 
         if config.datasets.type == "dynamic":
             self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
+
+    # --------- KOP ELBO helpers ----------
+    def _lambda_weights(self, t: torch.Tensor, ref_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-position λ(t) = dκ/(1-κ) from the *current* scheduler, expanded to [B, L].
+        """
+        sched = self.path.scheduler(t)  # alpha_t, d_alpha_t are [B]
+        kappa = sched.alpha_t
+        dkappa = sched.d_alpha_t
+        lam = dkappa / (1.0 - kappa + 1e-12)          # [B]
+        # lam = lam.clamp_max(self.lambda_clip)          # guard near t→1
+        # expand to [B, L] using ref_tokens as shape guide
+        return lam.view(-1, 1).expand_as(ref_tokens).to(ref_tokens.dtype)
+
+    def _reduce_loss_ce(
+        self,
+        ce: torch.Tensor,
+        mask_flat: torch.Tensor,
+        extra_w_flat: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Reduce CE over masked positions, optionally with extra weights.
+        ce: [B*L], mask_flat: [B*L] bool, extra_w_flat: [B*L] or None
+        """
+        if extra_w_flat is not None:
+            ce_m = ce[mask_flat]
+            w_m = extra_w_flat[mask_flat].float().to(ce.device)
+            return (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        else:
+            return ce[mask_flat].mean()
 
     def on_save_checkpoint(self, checkpoint):
         # Remove all parameters whose keys start with "audio_codec"
@@ -351,15 +392,19 @@ class DFMTTSWrapper(L.LightningModule):
         elif self.config.datasets.type == "offline" or \
             self.config.datasets.type == "offline_dynamic_dur":
             if len(batch) == 6:
-                x_1, transcription_ids, transcription_att_mask, cond, mask, loss_weight_extra = batch
+                x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
             else:
-                x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+                x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
 
         with torch.no_grad():
-            x_0 = cond
             t = torch.rand(x_1.shape[0], device=x_1.device)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+
+            x_t = path_sample.x_t
+            times_t = path_sample.t
+
+            m_corrupt = (x_t != x_1) & audio_att_mask.bool()
 
         if random.random() < self.config.datasets.cond_drop_prob:
             drop_text = True
@@ -370,25 +415,52 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.datasets.assert_drop_prob and self.config.datasets.cond_drop_prob == 0:
             assert drop_text == False , "Drop text should be False for training when cond_drop_prob is 0"
 
+        # print(f"TRAINER - TRAIN: {times_t}")
         logits = self(
-            x_t=path_sample.x_t,
+            x_t=x_t,
             text_ids=transcription_ids,
             text_att_mask=transcription_att_mask,
-            time=path_sample.t,
+            time=times_t,
             drop_text=drop_text,
         )
 
         ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
-        m  = mask.flatten(0, 1).bool()
+        m  = m_corrupt.flatten(0, 1).bool()
 
         # Apply mask to the loss
-        if loss_weight_extra is not None:
-            w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
-            ce_m = ce[m]
-            w_m = w[m]
-            loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        # if loss_weight_extra is not None:
+        #     w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
+        #     ce_m = ce[m]
+        #     w_m = w[m]
+        #     loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        # else:
+        #     loss = ce[m].mean()
+
+        # ---- Loss: CE or KOP-ELBO (mixture) ----
+        if self.loss_name == "kop_elbo":
+            # print("Using KOP-ELBO loss")
+            # per-position λ(t)
+            lam = self._lambda_weights(times_t, ref_tokens=x_1)        # [B, L]
+            lam_flat = lam.flatten(0, 1)
+            # optionally combine with provided pad/EOS weights
+            if loss_weight_extra is not None:
+                w_extra = loss_weight_extra.flatten(0, 1).float().to(ce.device)
+                w = lam_flat * w_extra
+            else:
+                w = lam_flat
+            # optional normalization to keep loss scale stable across schedules
+            # if self.lambda_normalize:
+            #     loss = self._reduce_loss_ce(ce, m, w)
+            # else:
+            # unnormalized weighted mean over masked
+            loss = (ce[m] * w[m]).mean()
         else:
-            loss = ce[m].mean()
+            flattened_audio_att_mask = audio_att_mask.flatten(0, 1).bool()
+            if loss_weight_extra is not None:
+                w = loss_weight_extra.flatten(0, 1).float().to(ce.device)
+                loss = self._reduce_loss_ce(ce, flattened_audio_att_mask, w)
+            else:
+                loss = ce[flattened_audio_att_mask].mean()
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -401,34 +473,64 @@ class DFMTTSWrapper(L.LightningModule):
         elif self.config.datasets.type == "offline" or \
             self.config.datasets.type == "offline_dynamic_dur":
             if len(batch) == 6:
-                x_1, transcription_ids, transcription_att_mask, cond, mask, loss_weight_extra = batch
+                x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
             else:
-                x_1, transcription_ids, transcription_att_mask, cond, mask = batch
+                x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
 
         with torch.no_grad():
-            x_0 = cond
             t = torch.rand(x_1.shape[0], device=x_1.device)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
+            x_t = path_sample.x_t
+            times_t = path_sample.t
+
+            m_corrupt = (x_t != x_1) & audio_att_mask.bool()
+
+        # print(f"TRAINER - VAL: {times_t}")
         logits = self(
-            x_t=path_sample.x_t,
+            x_t=x_t,
             text_ids=transcription_ids,
             text_att_mask=transcription_att_mask,
-            time=path_sample.t,
+            time=times_t,
             drop_text=False,
         )
 
         ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
-        m  = mask.flatten(0, 1).bool()
+        # m  = mask.flatten(0, 1).bool()
         # Apply mask to the loss
-        if loss_weight_extra is not None:
-            w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
-            ce_m = ce[m]
-            w_m = w[m]
-            loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        # if loss_weight_extra is not None:
+        #     w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
+        #     ce_m = ce[m]
+        #     w_m = w[m]
+        #     loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
+        # else:
+        #     loss = ce[m].mean()
+        # ---- Loss: CE or KOP-ELBO (mixture) ----
+        if self.loss_name == "kop_elbo":
+            m  = m_corrupt.flatten(0, 1).bool()
+            # per-position λ(t)
+            lam = self._lambda_weights(times_t, ref_tokens=x_1)        # [B, L]
+            lam_flat = lam.flatten(0, 1)
+            # optionally combine with provided pad/EOS weights
+            if loss_weight_extra is not None:
+                w_extra = loss_weight_extra.flatten(0, 1).float().to(ce.device)
+                w = lam_flat * w_extra
+            else:
+                w = lam_flat
+            # optional normalization to keep loss scale stable across schedules
+            # if self.lambda_normalize:
+            #     loss = self._reduce_loss_ce(ce, m, w)
+            # else:
+            # unnormalized weighted mean over masked
+            loss = (ce[m] * w[m]).mean()
         else:
-            loss = ce[m].mean()
+            flattened_audio_att_mask = audio_att_mask.flatten(0, 1).bool()
+            if loss_weight_extra is not None:
+                w = loss_weight_extra.flatten(0, 1).float().to(ce.device)
+                loss = self._reduce_loss_ce(ce, flattened_audio_att_mask, w)
+            else:
+                loss = ce[flattened_audio_att_mask].mean()
 
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -559,7 +661,11 @@ class DFMTTSWrapper(L.LightningModule):
             one_hot_x_t = torch.nn.functional.one_hot(xt, num_classes=S).float()
             # Compute the velocity update using the denoiser formulation
             # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
-            u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
+            # u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
+            sched = self.path.scheduler(t_tensor)
+            kappa = sched.alpha_t.item()
+            dkappa = sched.d_alpha_t.item()
+            u = (dkappa / (1.0 - kappa + eps)) * (p1 - one_hot_x_t)
             # Euler update: compute new probabilities and sample the updated state
             new_probs = one_hot_x_t + dt * u
             new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
@@ -743,11 +849,11 @@ class DFMTTSWrapper(L.LightningModule):
         # remove making tokens from the generated sequence
         xt = xt.squeeze(0)
         print("Shape after squeeze:", xt.shape)
-        # remove the right part after "audio_eos_token"
-        # find the first audio_eos_token, dont use argmax use the id of audio_eos_token
-        eos_index = (xt == self.config.datasets.audio_eos_token).nonzero(as_tuple=True)[0]
-        if eos_index.numel() > 0:
-            xt = xt[..., :eos_index]
+        # Trim to the first EOS (if present)
+        eos_pos = (xt == self.config.datasets.audio_eos_token).nonzero(as_tuple=False).squeeze(-1)
+        if eos_pos.numel() > 0:
+            first_eos = int(eos_pos[0].item())
+            xt = xt[..., :first_eos]
         xt = xt[xt != self.config.datasets.audio_eos_token]
         print(f"Shape after eos removal:", xt.shape)
         xt = xt[xt != self.config.datasets.audio_mask_token]

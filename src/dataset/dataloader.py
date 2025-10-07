@@ -277,6 +277,9 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         if self.pad_loss_weight != 1.0:
             print(f"\n\tUsing pad loss weight: {self.pad_loss_weight}!!!\n")
 
+    def time_scheduler_cubic_kappa(self, t: torch.Tensor, a: float = 0.0, b: float = 2.0) -> torch.Tensor:
+        return (-2*t**3 + 3*t**2 + a*(t**3 - 2*t**2 + t) + b*(t**3 - t**2)).clamp(0.0, 1.0)
+
     def mask_audio_and_create_loss_mask(
         self,
         audio_codes_padded: torch.Tensor,
@@ -290,9 +293,10 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         B, L = audio_codes_padded.shape
 
         # Sample masking prob per sequence (on-device)
-        p_seq = torch.empty(B, device=audio_codes_padded.device, dtype=torch.float32)
-        p_seq.uniform_(self.mask_prob[0], self.mask_prob[1])
-
+        conditioning_rev_rate = torch.empty(B, device=audio_codes_padded.device, dtype=torch.float32)
+        conditioning_rev_rate.uniform_(self.mask_prob[0], self.mask_prob[1])
+        # kappa_t = self.time_scheduler_cubic_kappa(time_step)
+        masking_rate = 1.0 - conditioning_rev_rate
         # Decide where masking *may* happen.
         # - If using EOS-as-pad and training on the EOS tail, valid = all positions.
         # - Else valid = audio_att_mask (i.e., tokens up to and incl. the gold EOS).
@@ -303,7 +307,7 @@ class OfflineMultipleSpeakerMaskCollateFunc:
 
         if self.mask_type == "random":
             rand = torch.rand(B, L, device=audio_codes_padded.device)
-            mask = (rand < p_seq[:, None]) & valid
+            mask = (rand < masking_rate[:, None]) & valid
 
             masked_audio = audio_codes_padded.clone()
             masked_audio[mask] = self.audio_mask_token
@@ -323,7 +327,7 @@ class OfflineMultipleSpeakerMaskCollateFunc:
                     valid_length = valid_idx.numel()
 
                 if valid_length > 0:
-                    block_length = max(1, int(valid_length * float(p_seq[i].item())))
+                    block_length = max(1, int(valid_length * float(masking_rate[i].item())))
                     start_max = max(0, valid_length - block_length)
                     start = 0 if start_max == 0 else torch.randint(0, start_max + 1, (1,), device=audio_codes_padded.device).item()
 
@@ -405,7 +409,7 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         audio_att_mask = (arangeL < lengths_with_eos.unsqueeze(1))  # [B, L] bool
 
         # Masking (now uses audio_att_mask and respects the two new flags)
-        masked_audio_codes, mask = self.mask_audio_and_create_loss_mask(audio_codes_padded, audio_att_mask)
+        masked_audio_codes, _ = self.mask_audio_and_create_loss_mask(audio_codes_padded, audio_att_mask)
 
         if self.use_eos_as_pad and self.loss_on_eos_pad and self.pad_loss_weight < 1.0:
             # 1.0 for content + gold EOS; pad positions get down-weighted
@@ -420,8 +424,12 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         )
         transcription_attention_mask = (transcription_padded != self.text_pad_token)
 
-        # Return order stays EXACTLY the same:
-        return audio_codes_padded, transcription_padded, transcription_attention_mask, masked_audio_codes, mask, loss_weight
+        # x_1 = audio_codes_padded
+        # x_t = masked_audio_codes
+        # text_cond = transcription_padded
+        # text_cond_mask = transcription_attention_mask
+        # t = times_t
+        return audio_codes_padded, transcription_padded, transcription_attention_mask, masked_audio_codes, audio_att_mask, loss_weight
 
 
 class DurationBPEOfflineDataset(torch.utils.data.Dataset):

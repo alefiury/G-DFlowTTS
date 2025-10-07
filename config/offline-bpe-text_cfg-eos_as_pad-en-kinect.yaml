@@ -1,10 +1,15 @@
-title: Continue-4cpnkkr9-DFMTTS-HiFITTS2_5K-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: Continue-xk4d0pzj-DFMTTS-KINETIC-OPTIMAL-HiFITTS2_5K-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
 model_type: "dit_adaln"
 # source_dist_type: "uniform"
 source_dist_type: "mask"
+
+kop_scheduler: true
+
+loss:
+    name: "kop_elbo"
 
 datasets:
     type: "offline"

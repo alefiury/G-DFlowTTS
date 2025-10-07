@@ -131,6 +131,22 @@ class MixtureDiscreteProbPath():
 
         return (d_kappa_t / (1 - kappa_t)) * (posterior - x_t)
 
+
+# Kinetic-optimal mixture scheduler (masked/uniform source)
+class KineticOptimalMixtureScheduler:
+    def __call__(self, t: torch.Tensor) -> SchedulerOutput:
+        # κ(t) = sin^2(pi t / 2),  κ̇(t) = (pi/2) sin(pi t)
+        kappa = torch.sin(0.5 * torch.pi * t)**2
+        dkappa = 0.5 * torch.pi * torch.sin(torch.pi * t)
+        sigma = 1.0 - kappa
+        return SchedulerOutput(
+            alpha_t=kappa,
+            sigma_t=sigma,
+            d_alpha_t=dkappa,
+            d_sigma_t=-dkappa
+        )
+
+
 class PolynomialConvexScheduler():
     """Polynomial Scheduler."""
 

@@ -1,4 +1,4 @@
-title: DFMTTS-Multilingual-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: Continue-fkpl1tsp-DFMTTS-Multilingual-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -79,7 +79,7 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    max_steps: 1000000
+    max_steps: 300000
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
@@ -91,7 +91,7 @@ trainer:
 
 model_checkpoint:
     mode: "min"
-    save_top_k: 5
+    save_top_k: 2
     save_last: true
     save_weights_only: false
     every_n_train_steps: 100000
