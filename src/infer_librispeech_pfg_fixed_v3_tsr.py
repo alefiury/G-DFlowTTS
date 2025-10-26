@@ -468,12 +468,13 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--alpha_strength", type=float, default=0.0)
     parser.add_argument("--kappa_kind", type=str, choices=["cubic", "linear"], default="cubic", help="Scheduler path κ(t): cubic or linear.")
-    parser.add_argument("--integrator", type=str, choices=["euler", "midpoint", "heun"], default="midpoint", help="CTMC integrator: Euler, Midpoint, or Heun.")
+    parser.add_argument("--integrator", type=str, choices=["euler", "midpoint", "heun"], default="euler", help="CTMC integrator: Euler, Midpoint, or Heun.")
     args = parser.parse_args()
 
     base_dir = "/raid/aluno_alef/DFM-TTS-2/src"
-    use_oracle_length = True
-    nsf = [16, 32, 64, 128, 256, 512, 1024]
+    use_oracle_length = False
+    # nsf = [16, 32, 64, 128, 256, 512, 1024]
+    nsf = [256, 512]
     # nsf = [1024]
     noise=args.noise
     guidance_scale=args.guidance_scale
@@ -482,7 +483,7 @@ def main():
     libri_speech_test_clean_metadata = "/raid/aluno_alef/DATASETS/LibriSpeech-test-clean-filtered.csv"
     integrator = args.integrator
 
-    pfg_list = ["m1ejk3am", "xcrhi3ra", "px8ocppp", "fkpl1tsp", "w1kigq88", "b9gp3yjn", "mnporf1f", "nsrtslsi"]
+    pfg_list = ["m1ejk3am", "xcrhi3ra", "px8ocppp", "fkpl1tsp", "w1kigq88", "b9gp3yjn", "mnporf1f"]
 
     ################################################################################
     # select model to evaluate
@@ -553,12 +554,6 @@ def main():
         output_dir = f"v4-librispeech-test-clean-filtered/mnporf1f-multilingual-bpe-pfg-en-eos_as_pad-pad_as_loss-cubic-corrector-use_oracle_length_{use_oracle_length}-noise_{noise}-guidance_scale_{guidance_scale}-alpha_strength_{alpha_strength}-kappa_kind_{kappa_kind}-integrator_{integrator}"
         config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-eos_as_pad-en.yaml"
         pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/mnporf1f/checkpoints/epoch=11-step=200000-val/loss_epoch=2.752.ckpt"
-
-    elif args.wandb_id == "nsrtslsi":
-        print("\n\n\t Evaluating nsrtslsi: nsrtslsi multilingual BPE-PFG-en-eos_as_pad-pad_as_loss-cubic model \n\n")
-        output_dir = f"70khours-emilia-yodas-tsr-librispeech-test-clean-filtered/nsrtslsi-multilingual-bpe-pfg-en-eos_as_pad-pad_as_loss-cubic-corrector-use_oracle_length_{use_oracle_length}-noise_{noise}-guidance_scale_{guidance_scale}-alpha_strength_{alpha_strength}-kappa_kind_{kappa_kind}-integrator_{integrator}"
-        config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-eos_as_pad-en-emilia_yodas.yaml"
-        pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/nsrtslsi/checkpoints/epoch=02-step=530000-val/loss_epoch=2.715.ckpt"
     else:
         raise ValueError("Invalid wandb_id. Please provide a valid wandb_id.")
 

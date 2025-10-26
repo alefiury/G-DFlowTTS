@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 from torch.optim import Adam, AdamW
 from lightning.pytorch.utilities import grad_norm
 from xcodec2.modeling_xcodec2 import XCodec2Model
+from neucodec import NeuCodec
 from torch.distributions.categorical import Categorical
 
 from modules.model import Transformer
@@ -84,7 +85,13 @@ class DFMTTSWrapper(L.LightningModule):
             raise ValueError(f"Invalid model type: {self.config.model_type}")
 
         if config.datasets.type == "dynamic":
-            self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
+            if config.datasets.get("codec_name", "") == "xcodec2":
+                self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
+            elif config.datasets.get("codec_name", "") == "neucodec":
+                model = NeuCodec.from_pretrained("neuphonic/neucodec")
+                model.eval().cuda()
+            else:
+                raise ValueError(f"Invalid codec name: {config.datasets.codec_name}")
 
     # --------- KOP ELBO helpers ----------
     def _lambda_weights(self, t: torch.Tensor, ref_tokens: torch.Tensor) -> torch.Tensor:
@@ -548,7 +555,16 @@ class DFMTTSWrapper(L.LightningModule):
         audio_ref_path = self.config.test.audio_ref_path
         text_ref = self.config.test.text_ref
 
-        audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec).to(self.device)
+        if self.config.datasets.codec_name == "xcodec2":
+            audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec).to(self.device)
+            saving_sr = audio_codec.config.sampling_rate
+        elif self.config.datasets.codec_name == "neucodec":
+            audio_codec = NeuCodec.from_pretrained("neuphonic/neucodec").to(self.device)
+            saving_sr = 24000
+            audio_codec.eval()
+        else:
+            raise ValueError(f"Invalid codec name: {self.config.datasets.codec_name}")
+
         audio_ref, audio_ref_sr = torchaudio.load(audio_ref_path)
 
         if audio_ref_sr != self.config.datasets.sampling_rate:
@@ -556,7 +572,12 @@ class DFMTTSWrapper(L.LightningModule):
 
         print(f"Audio reference shape: {audio_ref.shape}")
 
-        codes_ref = audio_codec.encode_code(input_waveform=audio_ref).squeeze()
+        if self.config.datasets.codec_name == "xcodec2":
+            codes_ref = audio_codec.encode_code(input_waveform=audio_ref).squeeze()
+        elif self.config.datasets.codec_name == "neucodec":
+            codes_ref = audio_codec.encode_code(audio_ref[None, ...]).squeeze()
+            print("-"*100)
+            print(f"Codes reference after encoding shape: {codes_ref.shape}")
         codes_ref_size = codes_ref.shape[-1]
 
         print(f"Codes reference shape: {codes_ref_size}")
@@ -614,7 +635,7 @@ class DFMTTSWrapper(L.LightningModule):
             key = f"generated_audio_{idx}"
             generated_audios[key] = wandb.Audio(
                 generated_audio[0, 0, :].cpu().numpy(),
-                sample_rate=self.config.datasets.sampling_rate,
+                sample_rate=saving_sr,
                 caption=sentence
             )
         wandb.log(generated_audios)
@@ -850,10 +871,10 @@ class DFMTTSWrapper(L.LightningModule):
         xt = xt.squeeze(0)
         print("Shape after squeeze:", xt.shape)
         # Trim to the first EOS (if present)
-        eos_pos = (xt == self.config.datasets.audio_eos_token).nonzero(as_tuple=False).squeeze(-1)
-        if eos_pos.numel() > 0:
-            first_eos = int(eos_pos[0].item())
-            xt = xt[..., :first_eos]
+        # eos_pos = (xt == self.config.datasets.audio_eos_token).nonzero(as_tuple=False).squeeze(-1)
+        # if eos_pos.numel() > 0:
+        #     first_eos = int(eos_pos[0].item())
+        #     xt = xt[..., :first_eos]
         xt = xt[xt != self.config.datasets.audio_eos_token]
         print(f"Shape after eos removal:", xt.shape)
         xt = xt[xt != self.config.datasets.audio_mask_token]

@@ -25,6 +25,9 @@ from lightning.pytorch.loggers import WandbLogger
 from torch.distributions.categorical import Categorical
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
+from torchaudio.transforms import Resample
+from neucodec import NeuCodec
+
 from modules.pl_wrapper import DFMTTSWrapper
 from modules.dp_wrapper import DurationPredictorWrapper
 from utils.tokenizer import VoiceBpeTokenizer
@@ -186,16 +189,28 @@ def inference_pfg(
     if sequence_length is None:
         sequence_length = get_remaining_duration(duration_model, text_ids=text_ids, codes_ref=codes_ref, device=device)
 
+    orig_ref_code_len = codes_ref.shape[-1]
+
     # init xt + pin prefix
     if codes_ref is None:
         raise ValueError("codes_ref must be provided.")
-    xt = torch.full((1, sequence_length + codes_ref.size(0)), mask_token_id, device=device, dtype=torch.long)
-    orig_ref_code_len = int(codes_ref.size(0))
-    if codes_ref.size(0) < xt.size(1):
-        codes_ref = F.pad(codes_ref, (0, xt.size(1) - codes_ref.size(0)), value=mask_token_id).unsqueeze(0).to(device)
-    else:
-        codes_ref = codes_ref.unsqueeze(0).to(device)
+    xt = torch.full((1, sequence_length + orig_ref_code_len), mask_token_id, device=device, dtype=torch.long)
+
+    print(f"\n\n1 - INSIDE: xt shape: {xt.shape} | {sequence_length + orig_ref_code_len}\n\n")
+    # if orig_ref_code_len < xt.size(1):
+    #     codes_ref = F.pad(codes_ref, (0, xt.size(1) - orig_ref_code_len), value=mask_token_id).unsqueeze(0).to(device)
+    # else:
+    #     codes_ref = codes_ref.unsqueeze(0).to(device)
     xt[..., :orig_ref_code_len] = codes_ref[..., :orig_ref_code_len]
+
+    print(f"\n\n2 - INSIDE: xt shape: {xt.shape} | {sequence_length + orig_ref_code_len}\n\n")
+
+
+    # audio_codec = NeuCodec.from_pretrained("neuphonic/neucodec").to(device)
+    # saving_sr = 24000
+    # audio_codec.eval()
+    # reconstructed_ref_audio = audio_codec.decode_code(codes_ref[..., :orig_ref_code_len].long().to(device))
+    # torchaudio.save(os.path.join("/raid/aluno_alef/DFM-TTS-2/src", "70khours-emilia-yodas-tsr-librispeech-test-clean-filtered", f"v2_reconstructed_ref_audio_{0}.wav"), reconstructed_ref_audio.squeeze(0).cpu(), saving_sr)
 
     # time grid
     num_steps = int(nsf)
@@ -347,6 +362,8 @@ def inference_pfg(
             xt = torch.distributions.Categorical(probs=probs).sample()
             xt[..., :orig_ref_code_len] = codes_ref[..., :orig_ref_code_len]
 
+    xt[..., :orig_ref_code_len] = codes_ref[..., :orig_ref_code_len]
+
     return xt
 
 
@@ -457,6 +474,33 @@ def inference(
         xt[..., :orig_ref_code_len] = codes_ref[..., :orig_ref_code_len]
 
     return xt
+
+
+def _ensure_mono_16k(wav_path: str, sr: int) -> torch.Tensor:
+    wav, sr = torchaudio.load(wav_path)
+    """(C,T) -> (1,T_16k) as float32 in [-1,1]."""
+    if wav.dim() != 2:
+        raise ValueError(f"Expected waveform shape (C,T), got {tuple(wav.shape)}")
+    if wav.size(0) > 1:
+        wav = wav.mean(0, keepdim=True)
+    if sr != 16_000:
+        wav = Resample(sr, 16_000)(wav)
+    # Clamp to [-1,1] just in case
+    wav = wav.clamp_(-1.0, 1.0)
+    return wav
+
+
+@torch.inference_mode()
+def _encode_audio(model, wav_path: str) -> torch.Tensor:
+    """
+    Try common encode methods to obtain integer code sequence.
+    Returns a 1-D LongTensor of shape (L,)
+    """
+    wav_1c16k = _ensure_mono_16k(wav_path, 16_000)
+    # print(wav_1c16k[None, ...].shape)
+    out = model.encode_code(wav_1c16k[None, ...])
+    # Squeeze batch and channel dims
+    return out.long().cpu()
 
 
 @torch.no_grad()
@@ -588,79 +632,100 @@ def main():
     model = DFMTTSWrapper.load_from_checkpoint(pretrained_checkpoint, config=config, map_location=device, strict=False)
     model.eval()
 
-    audio_codec = XCodec2Model.from_pretrained(config.datasets.audio_codec).to(device)
+    # audio_codec = XCodec2Model.from_pretrained(config.datasets.audio_codec).to(device)
+    # audio_codec.eval()
+
+    audio_codec = NeuCodec.from_pretrained("neuphonic/neucodec").to(device)
+    saving_sr = 24000
     audio_codec.eval()
 
     os.makedirs(output_dir, exist_ok=True)
 
     for idx, row in tqdm(df.iterrows(), total=len(df)):
-        try:
-            text = row["text"]
-            text_ref = row["ref_text"]
+        # try:
+        text = row["text"]
+        text_ref = row["ref_text"]
 
-            filepath_codec = row["filepath_codec"]
-            ref_filepath_codec = row["reference_codec"]
+        # filepath_codec = row["filepath_codec"]
+        # ref_filepath_codec = row["reference_codec"]
 
-            codes_ref = torch.load(ref_filepath_codec).squeeze().to(device)
+        # codes_ref = torch.load(ref_filepath_codec).squeeze().to(device)
 
-            oracle_length = None
-            if use_oracle_length:
-                oracle_codes = torch.load(filepath_codec).squeeze()
-                oracle_length = oracle_codes.shape[-1]
+        codes_ref = _encode_audio(audio_codec, row["reference"]).to(device)
+        print(f"\n\nCodes ref shape: {codes_ref.shape}\n\n")
 
-            for n in tqdm(nsf):
-                output_filepath = os.path.join(base_dir, output_dir, f"audio_{idx}-{n}.wav")
-                if os.path.exists(output_filepath):
-                    # print(f"File {output_filepath} already exists, skipping...")
-                    continue
+        # # decode and save the reconstructed reference audio for sanity check
+        # reconstructed_ref_audio = audio_codec.decode_code(codes_ref.long().to(device))
+        # torchaudio.save(os.path.join(base_dir, output_dir, f"reconstructed_ref_audio_{idx}.wav"), reconstructed_ref_audio.squeeze(0).cpu(), saving_sr)
 
-                if args.wandb_id in pfg_list:
-                    x_t = inference_pfg(
-                        config=config,
-                        model=model,
-                        duration_model=duration_model,
-                        tokenizer=tokenizer,
-                        sentence=text,
-                        nsf=n,
-                        text_ref=text_ref,
-                        codes_ref=codes_ref,
-                        device=device,
-                        sequence_length=oracle_length if use_oracle_length else None,
-                        noise=noise,
-                        guidance_scale=guidance_scale,
-                        alpha_strength=alpha_strength,
-                        kappa_kind=kappa_kind,
-                        integrator=args.integrator,
-                    )
-                else:
-                    x_t = inference(
-                        config=config,
-                        model=model,
-                        duration_model=duration_model,
-                        tokenizer=tokenizer,
-                        sentence=text,
-                        nsf=n,
-                        text_ref=text_ref,
-                        codes_ref=codes_ref,
-                        device=device,
-                        sequence_length=oracle_length if use_oracle_length else None,
-                    )
-                # remove making tokens from the generated sequence
-                x_t = x_t.squeeze(0)
-                x_t = x_t[codes_ref.size(0):]
 
-                x_t = x_t[x_t != config.datasets.audio_eos_token]
-                x_t = x_t[x_t != config.datasets.audio_mask_token]
-                # remove padding tokens from the generated sequence
-                if hasattr(config.datasets, "audio_pad_token"):
-                    x_t = x_t[x_t != config.datasets.audio_pad_token]
-                x_t = x_t.unsqueeze(0).unsqueeze(0)
-                # Decode the final token sequence into an audio waveform
-                generated_audio = audio_codec.decode_code(x_t)
-                torchaudio.save(output_filepath, generated_audio.squeeze(0).cpu(), 16000)
-        except Exception as e:
-            print(f"Error processing row {idx}: {e}")
-            continue
+        oracle_length = None
+        if use_oracle_length:
+            # oracle_codes = torch.load(filepath_codec).squeeze()
+            # oracle_length = oracle_codes.shape[-1]
+            oracle_codes = _encode_audio(audio_codec, row["filepath"]).to(device)
+            oracle_length = oracle_codes.shape[-1]
+
+            print(f"\n\nOracle length: {oracle_length}\n\n")
+
+        for n in tqdm(nsf):
+            output_filepath = os.path.join(base_dir, output_dir, f"audio_{idx}-{n}.wav")
+            if os.path.exists(output_filepath):
+                # print(f"File {output_filepath} already exists, skipping...")
+                continue
+
+            if args.wandb_id in pfg_list:
+                print("\n\nUsing PFG inference...\n\n")
+                x_t = inference_pfg(
+                    config=config,
+                    model=model,
+                    duration_model=duration_model,
+                    tokenizer=tokenizer,
+                    sentence=text,
+                    nsf=n,
+                    text_ref=text_ref,
+                    codes_ref=codes_ref.squeeze(0),
+                    device=device,
+                    sequence_length=oracle_length if use_oracle_length else None,
+                    noise=noise,
+                    guidance_scale=guidance_scale,
+                    alpha_strength=alpha_strength,
+                    kappa_kind=kappa_kind,
+                    integrator=args.integrator,
+                )
+            else:
+                x_t = inference(
+                    config=config,
+                    model=model,
+                    duration_model=duration_model,
+                    tokenizer=tokenizer,
+                    sentence=text,
+                    nsf=n,
+                    text_ref=text_ref,
+                    codes_ref=codes_ref,
+                    device=device,
+                    sequence_length=oracle_length if use_oracle_length else None,
+                )
+            # remove making tokens from the generated sequence
+            x_t = x_t.squeeze(0)
+            x_t = x_t[codes_ref.shape[-1]:]
+
+            print(f"\n\n1 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
+
+            x_t = x_t[x_t != config.datasets.audio_eos_token]
+            x_t = x_t[x_t != config.datasets.audio_mask_token]
+
+            print(f"\n\n2 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
+            # remove padding tokens from the generated sequence
+            if hasattr(config.datasets, "audio_pad_token"):
+                x_t = x_t[x_t != config.datasets.audio_pad_token]
+            x_t = x_t.unsqueeze(0).unsqueeze(0)
+            # Decode the final token sequence into an audio waveform
+            generated_audio = audio_codec.decode_code(x_t.long().to(device))
+            torchaudio.save(output_filepath, generated_audio.squeeze(0).cpu(), saving_sr)
+        # except Exception as e:
+        #     print(f"Error processing row {idx}: {e}")
+        #     continue
 
 
 if __name__ == "__main__":

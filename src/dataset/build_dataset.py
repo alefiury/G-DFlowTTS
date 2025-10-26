@@ -12,13 +12,23 @@ from dataset.dataloader import DynamicSingleSpeakerDataset, OfflineMultipleSpeak
 
 def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
     train_df = pd.read_csv(config.datasets.train_metadata)
-    val_df = pd.read_csv(config.datasets.val_metadata)
+
+    if config.datasets.val_metadata == "":
+        # Get 5000 random samples from train_df for validation
+        val_df = train_df.sample(n=5000, random_state=42).reset_index(drop=True)
+        # Remove validation samples from train_df
+        train_df = train_df.drop(val_df.index).reset_index(drop=True)
+    else:
+        val_df = pd.read_csv(config.datasets.val_metadata)
 
     # if "language" column is not present, add it with a default value
     if "language" not in train_df.columns:
         train_df["language"] = "en"
     if "language" not in val_df.columns:
         val_df["language"] = "en"
+
+    print(f"Number of training samples: {len(train_df)}")
+    print(f"Number of validation samples: {len(val_df)}")
 
     text_tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
 

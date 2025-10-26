@@ -15,7 +15,7 @@ from modules.pl_wrapper import DFMTTSWrapper
 
 torch.autograd.set_detect_anomaly(True) # for debugging
 
-
+wandb.finish()
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
