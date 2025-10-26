@@ -125,8 +125,13 @@ class DDiTBlock(nn.Module):
         self.adaLN_modulation.weight.data.zero_()
         self.adaLN_modulation.bias.data.zero_()
 
-    def forward(self, x: Tensor, rotary_cos_sin: Tensor, c: Tensor) -> Tensor:
+    def forward(self, x: Tensor, rotary_cos_sin: Tensor, c: Tensor, att_mask: Tensor) -> Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
+
+        # Makes sure attn_mask has shape (batch_size, 1, 1, seq_len) for broadcasting
+        if att_mask.dim() == 2:
+            att_mask = att_mask[:, None, None, :]
+            att_mask = att_mask.to(device=x.device, dtype=torch.bool)
 
         (
             shift_msa,
@@ -165,7 +170,12 @@ class DDiTBlock(nn.Module):
             ).to(original_dtype)
 
         q, k, v = (item.transpose(1, 2) for item in (q, k, v))
-        x = F.scaled_dot_product_attention(query=q, key=k, value=v)
+        x = F.scaled_dot_product_attention(
+            query=q, 
+            key=k, 
+            value=v, 
+            # attn_mask=att_mask
+        )
         x = rearrange(x, "b h s d -> b s (h d)", b=batch_size)
 
         x = bias_dropout_add_scale(
@@ -216,18 +226,31 @@ class Transformer(nn.Module):
         n_heads: int,
         dropout: int,
         n_blocks: int,
-        add_token: int = 2, # mask + padding tokens
-        audio_pad_token: Optional[int] = 0
+        audio_add_token: int = 2, # mask + padding tokens
+        text_add_token: int = 1, # filler token
+        audio_pad_token: Optional[int] = 65538,
+        text_pad_token: Optional[int] = 0,
+        text_filler_token: Optional[int] = 6681,
     ):
         super().__init__()
-        self.audio_vocab_size = audio_vocab_size
-        self.audio_pad_token = audio_pad_token
-        self.text_vocab_size = text_vocab_size
+        true_audio_vocab_size = audio_vocab_size + audio_add_token
+        true_text_vocab_size = text_vocab_size + text_add_token
 
-        # + add_token to account for the mask and padding tokens
-        self.audio_embed = nn.Embedding(self.audio_vocab_size + add_token, hidden_size)
+        assert audio_pad_token < true_audio_vocab_size, \
+            f"audio_pad_token ({audio_pad_token}) must be less than audio_vocab_size + audio_add_token ({true_audio_vocab_size})"
+        assert text_pad_token < true_text_vocab_size, \
+            f"text_pad_token ({text_pad_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
+        assert text_filler_token < true_text_vocab_size, \
+            f"text_filler_token ({text_filler_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
+
+        self.text_vocab_size = text_vocab_size
+        self.text_pad_token = text_pad_token
+        self.text_filler_token = text_filler_token
+
+        # + audio_add_token to account for the mask and padding tokens
+        self.audio_embed = nn.Embedding(true_audio_vocab_size, hidden_size, padding_idx=audio_pad_token)
         # + 1 to account for the filler token
-        self.text_embed = nn.Embedding(self.text_vocab_size + 1, hidden_size)
+        self.text_embed = nn.Embedding(true_text_vocab_size, hidden_size, padding_idx=text_pad_token)
 
         self.time_embedding = TimestepEmbedder(hidden_size=cond_dim)
         self.rotary_emb = rotary.Rotary(dim=hidden_size // n_heads)
@@ -252,7 +275,7 @@ class Transformer(nn.Module):
 
         self.output_layer = DDitFinalLayer(
             hidden_size=hidden_size,
-            out_channels=audio_vocab_size + add_token,
+            out_channels=true_audio_vocab_size,
             cond_dim=cond_dim,
         )
 
@@ -260,21 +283,27 @@ class Transformer(nn.Module):
         self,
         x_t: Tensor,
         text: Tensor,
-        text_att_mask: Tensor,
         time: Tensor,
         drop_text: bool = False,
+        text_att_mask: Optional[Tensor] = None,
+        audio_att_mask: Optional[Tensor] = None,
     ) -> Tensor:
         audio_emb = self.audio_embed(x_t)
         seq_len = audio_emb.shape[1]
 
+        if audio_att_mask is None:
+            audio_att_mask = torch.ones((x_t.shape[0], seq_len), device=x_t.device, dtype=torch.bool)
+
+        if text_att_mask is None:
+            text_att_mask = torch.ones((text.shape[0], text.shape[1]), device=text.device, dtype=torch.bool)
+
         # Text Embedding
-        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx() (based on E2 TTS)
         text = text[:, :seq_len]
-        text = F.pad(text, (0, seq_len - text.shape[1]), value=0.0)
+        text = F.pad(text, (0, seq_len - text.shape[1]), value=self.text_filler_token)  # pad to audio length
 
         # Classifier Free Guidance (CFG) for the text conditioning
         if drop_text:
-            text = torch.zeros_like(text)
+            text = torch.full_like(text, self.text_filler_token)
         text_emb = self.text_embed(text)
 
         x = torch.cat([audio_emb, text_emb], dim=-1)
@@ -286,7 +315,7 @@ class Transformer(nn.Module):
         rotary_cos_sin = self.rotary_emb(x=x)
 
         for i in range(len(self.blocks)):
-            x = self.blocks[i](x=x, rotary_cos_sin=rotary_cos_sin, c=c)
+            x = self.blocks[i](x=x, rotary_cos_sin=rotary_cos_sin, c=c, att_mask=audio_att_mask)
 
         x = self.output_layer(x=x, c=c)
 

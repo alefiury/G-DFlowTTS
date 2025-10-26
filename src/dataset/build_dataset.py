@@ -53,7 +53,8 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
             speech_processor=speech_processor,
         )
     elif config.datasets.type == "offline" or \
-        config.datasets.type == "offline_dynamic_dur":
+        config.datasets.type == "offline_dynamic_dur" or \
+        config.datasets.type == "offline_voice_cloning_simplified":
         train_dataset = OfflineMultipleSpeakerDataset(
             data=train_df,
             base_dir=config.datasets.base_dir,

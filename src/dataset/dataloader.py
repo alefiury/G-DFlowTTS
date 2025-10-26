@@ -420,7 +420,9 @@ class OfflineMultipleSpeakerMaskCollateFunc:
 
         # Text padding + attention mask (unchanged)
         transcription_padded = pad_sequence(
-            tokenized_transcription_list, batch_first=True, padding_value=self.text_pad_token
+            tokenized_transcription_list,
+            batch_first=True,
+            padding_value=self.text_pad_token
         )
         transcription_attention_mask = (transcription_padded != self.text_pad_token)
 
@@ -430,6 +432,125 @@ class OfflineMultipleSpeakerMaskCollateFunc:
         # text_cond_mask = transcription_attention_mask
         # t = times_t
         return audio_codes_padded, transcription_padded, transcription_attention_mask, masked_audio_codes, audio_att_mask, loss_weight
+
+
+
+class OfflineVoiceCloningSimplifiedCollateFunc:
+    def __init__(
+        self,
+        max_audio_length: int,
+        audio_pad_token: int,
+        audio_eos_token: int,
+        text_pad_token: int,
+        mask_type: str,
+        audio_pad_type: str,
+        use_eos_as_pad: bool = False,
+    ):
+        """
+        Initializes the collate function for masking audio features.
+
+        Params:
+            max_audio_length (int): The maximum length of the audio sequences.
+            audio_pad_token (int): The token ID used for padding audio tokens.
+            audio_eos_token (int): The token ID used for the end of audio sequences.
+            text_pad_token (int): The token ID used for padding text tokens.
+            mask_type (str): The type of masking to apply ("random" or "contiguous").
+            audio_pad_type (str): The padding type for audio sequences ("variable" or "fixed").
+            use_eos_as_pad (bool): Whether to use the EOS token as padding.
+        """
+        self.max_audio_length = max_audio_length
+
+        self.audio_pad_token = audio_pad_token
+        self.audio_eos_token = audio_eos_token
+
+        self.text_pad_token = text_pad_token
+
+        self.mask_type = mask_type
+        self.audio_pad_type = audio_pad_type
+
+        self.use_eos_as_pad = use_eos_as_pad
+
+        if self.use_eos_as_pad:
+            print("\n\tUsing EOS token as padding!!!\n")
+
+    def pad_audio_codec(self, feature: torch.Tensor, max_length: int, padding_value: int = 0) -> torch.Tensor:
+        """
+        Pads the feature tensor along its sequence dimension to max_length.
+        Assumes feature has shape (B, L) or (B, L, D).
+        """
+        current_length = feature.size(1)
+        if current_length < max_length:
+            pad_amount = max_length - current_length
+            padded_feature = F.pad(
+                feature,
+                (0, pad_amount),
+                mode="constant",
+                value=padding_value
+            )
+            return padded_feature
+        elif current_length > max_length:
+            return feature[:, :max_length]
+        else:
+            return feature
+
+    def __call__(self, batch: List[str]):
+        audio_codes, tokenized_transcription_list = zip(*batch)
+
+        # Decide target batch length (still +1 for EOS)
+        if self.audio_pad_type == "variable":
+            max_audio_length = max([audio.shape[-1] + 1 for audio in audio_codes])  # +1 for EOS
+            max_audio_length = min(max_audio_length, self.max_audio_length)
+        elif self.audio_pad_type == "fixed":
+            max_audio_length = self.max_audio_length
+        else:
+            raise ValueError(f"Unknown audio_pad_type: {self.audio_pad_type}")
+
+        # NEW: effective pad id (EOS or PAD)
+        effective_pad_id = self.audio_eos_token if self.use_eos_as_pad else self.audio_pad_token
+
+        padded_audio_list = []
+        lengths_with_eos = []  # for attention mask
+
+        for audio in audio_codes:
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)  # [1, L]
+
+            # make room for EOS if we must truncate
+            if audio.size(1) >= max_audio_length:
+                audio = audio[:, :max_audio_length - 1]
+
+            # append gold EOS
+            eos_col = torch.full((audio.size(0), 1), self.audio_eos_token, dtype=audio.dtype, device=audio.device)
+            audio = torch.cat([audio, eos_col], dim=1)  # [1, L’]
+            lengths_with_eos.append(audio.size(1))      # scalar len including EOS
+
+            # pad/truncate to batch max with chosen effective pad id
+            padded_audio = self.pad_audio_codec(audio, max_audio_length, effective_pad_id)
+            if padded_audio.size(0) == 1:
+                padded_audio = padded_audio.squeeze(0)  # [L]
+            padded_audio_list.append(padded_audio)
+
+        audio_codes_padded = torch.stack(padded_audio_list, dim=0)  # [B, L]
+
+        # Build audio attention mask: True up to *gold* (content + EOS), False after
+        B, L = audio_codes_padded.shape
+        lengths_with_eos = torch.tensor(lengths_with_eos, device=audio_codes_padded.device, dtype=torch.long)
+        arangeL = torch.arange(L, device=audio_codes_padded.device).unsqueeze(0)  # [1, L]
+        # In this attention mask 1 means valid token (not padding)
+        audio_att_mask = (arangeL < lengths_with_eos.unsqueeze(1))  # [B, L] bool
+
+        # Text padding + attention mask (unchanged)
+        transcription_padded = pad_sequence(
+            tokenized_transcription_list,
+            batch_first=True,
+            padding_value=self.text_pad_token
+        )
+        transcription_att_mask = (transcription_padded != self.text_pad_token)
+
+        x_1 = audio_codes_padded
+        x_1_att_mask = audio_att_mask
+
+        return x_1, x_1_att_mask, transcription_padded, transcription_att_mask
 
 
 class DurationBPEOfflineDataset(torch.utils.data.Dataset):

@@ -23,23 +23,35 @@ from xcodec2.modeling_xcodec2 import XCodec2Model
 from neucodec import NeuCodec
 from torch.distributions.categorical import Categorical
 
+from torch.nn.modules.loss import _Loss
+from flow_matching.path import MixtureDiscreteProbPath, ProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from flow_matching.solver import MixtureDiscreteEulerSolver
+from flow_matching.loss import MixturePathGeneralizedKL
+
 from modules.model import Transformer
 from modules.model_cross_att import TransformerCrossAttn
 from utils.tokenizer import VoiceBpeTokenizer
 from dataset.build_dataset import build_dataset
 from utils.lr_schedulers import CosineWarmupLR, LinearLR
-from modules.flow import (
-    MixtureDiscreteProbPath,
-    PolynomialConvexScheduler,
-    KineticOptimalMixtureScheduler,
-    MaskedSourceDistribution,
-    UniformSourceDistribution
-)
+from modules.flow import KOConvexScheduler, MaskedSourceDistribution, UniformSourceDistribution
+
 from dataset.dataloader import (
     DynamicSingleSpeakerCollateFunc,
     OfflineMultipleSpeakerMaskCollateFunc,
-    OfflineMultipleSpeakerDreamOnCollateFunc
+    OfflineMultipleSpeakerDreamOnCollateFunc,
+    OfflineVoiceCloningSimplifiedCollateFunc,
 )
+
+
+def get_loss_function(loss_function: str, path: Optional[ProbPath] = None) -> _Loss:
+    if loss_function == "cross_entropy":
+        return torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+    elif loss_function == "generalized_kl":
+        assert path is not None, "Path must be provided for generalized_kl loss."
+        return MixturePathGeneralizedKL(path=path, reduction="none")
+    else:
+        raise ValueError(f"{loss_function} is not supported")
 
 
 class DFMTTSWrapper(L.LightningModule):
@@ -50,15 +62,10 @@ class DFMTTSWrapper(L.LightningModule):
         super().__init__()
         self.config = config
 
-        # --- Loss config (default = plain CE) ---
-        self.loss_name = getattr(getattr(config, "loss", None), "name", "ce").lower()
-        # self.lambda_clip = float(getattr(getattr(config, "loss", None), "lambda_clip", 50.0))
-        # self.lambda_normalize = bool(getattr(getattr(config, "loss", None), "normalize", True))
-
         if self.config.source_dist_type == "uniform":
             self.source_distribution = UniformSourceDistribution(
-                vocab_size=self.config.datasets.audio_vocab_size
-            )
+                vocab_size=self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1
+            ) # +audio_add_token - 1 because we don't want to sample the padding token
         elif self.config.source_dist_type == "mask":
             self.source_distribution = MaskedSourceDistribution(
                 mask_token=self.config.datasets.audio_mask_token
@@ -66,16 +73,19 @@ class DFMTTSWrapper(L.LightningModule):
         else:
             raise ValueError(f"Invalid source distribution: {self.config.source_dist_type}")
 
-        if getattr(self.config, "kop_scheduler", False):
+        if self.config.scheduler_type == "ko":
+            print("\n\nUsing KO scheduler!\n\n")
             self.path = MixtureDiscreteProbPath(
-                scheduler=KineticOptimalMixtureScheduler()
+                scheduler=KOConvexScheduler()
             )
-        else:
+        elif self.config.scheduler_type == "polynomial":
             self.path = MixtureDiscreteProbPath(
                 scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
             )
+        else:
+            raise ValueError(f"Invalid scheduler type: {self.config.scheduler.type}")
 
-        self.criteria = torch.nn.CrossEntropyLoss(reduction="none")
+        self.criteria = get_loss_function(loss_function=self.config.loss.function, path=self.path)
 
         if self.config.model_type.lower() == "dit_adaln":
             self.model = Transformer(**self.config.model)
@@ -92,36 +102,6 @@ class DFMTTSWrapper(L.LightningModule):
                 model.eval().cuda()
             else:
                 raise ValueError(f"Invalid codec name: {config.datasets.codec_name}")
-
-    # --------- KOP ELBO helpers ----------
-    def _lambda_weights(self, t: torch.Tensor, ref_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Compute per-position λ(t) = dκ/(1-κ) from the *current* scheduler, expanded to [B, L].
-        """
-        sched = self.path.scheduler(t)  # alpha_t, d_alpha_t are [B]
-        kappa = sched.alpha_t
-        dkappa = sched.d_alpha_t
-        lam = dkappa / (1.0 - kappa + 1e-12)          # [B]
-        # lam = lam.clamp_max(self.lambda_clip)          # guard near t→1
-        # expand to [B, L] using ref_tokens as shape guide
-        return lam.view(-1, 1).expand_as(ref_tokens).to(ref_tokens.dtype)
-
-    def _reduce_loss_ce(
-        self,
-        ce: torch.Tensor,
-        mask_flat: torch.Tensor,
-        extra_w_flat: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Reduce CE over masked positions, optionally with extra weights.
-        ce: [B*L], mask_flat: [B*L] bool, extra_w_flat: [B*L] or None
-        """
-        if extra_w_flat is not None:
-            ce_m = ce[mask_flat]
-            w_m = extra_w_flat[mask_flat].float().to(ce.device)
-            return (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
-        else:
-            return ce[mask_flat].mean()
 
     def on_save_checkpoint(self, checkpoint):
         # Remove all parameters whose keys start with "audio_codec"
@@ -175,6 +155,16 @@ class DFMTTSWrapper(L.LightningModule):
                 loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
                 pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
             )
+        elif self.config.datasets.type == "offline_voice_cloning_simplified":
+            collate_fn = OfflineVoiceCloningSimplifiedCollateFunc(
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
+                text_pad_token=self.config.datasets.text_pad_token,
+                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
         else:
             raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
 
@@ -225,6 +215,16 @@ class DFMTTSWrapper(L.LightningModule):
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
                 loss_on_eos_pad=self.config.datasets.loss_on_eos_pad,
                 pad_loss_weight=getattr(self.config.datasets, "pad_loss_weight", 1.0),
+            )
+        elif self.config.datasets.type == "offline_voice_cloning_simplified":
+            collate_fn = OfflineVoiceCloningSimplifiedCollateFunc(
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
+                text_pad_token=self.config.datasets.text_pad_token,
+                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
             )
         else:
             raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
@@ -361,22 +361,6 @@ class DFMTTSWrapper(L.LightningModule):
         norms = grad_norm(self.model, norm_type=2)
         self.log_dict(norms)
 
-    def forward(
-        self,
-        x_t: Tensor,
-        text_ids: Tensor,
-        text_att_mask: Tensor,
-        time: Tensor,
-        drop_text: bool = False,
-    ) -> Tuple[Tensor, Tensor]:
-        return self.model(
-            x_t=x_t,
-            text=text_ids,
-            text_att_mask=text_att_mask,
-            time=time,
-            drop_text=drop_text,
-        )
-
     def get_speech_token(self, input_waveform, input_features):
         """
         Extract speech token sequence using the encoder.
@@ -392,26 +376,48 @@ class DFMTTSWrapper(L.LightningModule):
             speech_tokens = speech_tokens.squeeze(1)
         return speech_tokens.long()
 
+    def forward(
+        self,
+        x_t: Tensor,
+        text_ids: Tensor,
+        time: Tensor,
+        drop_text: bool = False,
+        text_att_mask: Tensor = None,
+        audio_att_mask: Tensor = None,
+    ) -> Tuple[Tensor, Tensor]:
+        return self.model(
+            x_t=x_t,
+            text=text_ids,
+            time=time,
+            drop_text=drop_text,
+            text_att_mask=text_att_mask,
+            audio_att_mask=audio_att_mask,
+        )
+
     def training_step(self, batch, batch_idx):
         if self.config.datasets.type == "dynamic":
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
         elif self.config.datasets.type == "offline" or \
-            self.config.datasets.type == "offline_dynamic_dur":
+            self.config.datasets.type == "offline_dynamic_dur" or \
+            self.config.datasets.type == "offline_voice_cloning_simplified":
             if len(batch) == 6:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
-            else:
+            elif len(batch) == 5:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
+            elif len(batch) == 4:
+                print("Batch with 4 elements detected. Sampling x_0 from source distribution.")
+                x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
+                x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
+                print(f"x_0 shape: {x_0.shape}")
+                print(x_0)
+            else:
+                raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
             t = torch.rand(x_1.shape[0], device=x_1.device)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
-
-            x_t = path_sample.x_t
-            times_t = path_sample.t
-
-            m_corrupt = (x_t != x_1) & audio_att_mask.bool()
 
         if random.random() < self.config.datasets.cond_drop_prob:
             drop_text = True
@@ -424,50 +430,37 @@ class DFMTTSWrapper(L.LightningModule):
 
         # print(f"TRAINER - TRAIN: {times_t}")
         logits = self(
-            x_t=x_t,
+            x_t=path_sample.x_t,
             text_ids=transcription_ids,
-            text_att_mask=transcription_att_mask,
-            time=times_t,
+            time=path_sample.t,
             drop_text=drop_text,
+            audio_att_mask=audio_att_mask,
+            text_att_mask=transcription_att_mask,
         )
 
-        ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
-        m  = m_corrupt.flatten(0, 1).bool()
+        if self.config.loss.function == "generalized_kl":
+            # loss = self.criteria(
+            #     logits=logits,
+            #     x_1=x_1,
+            #     x_t=path_sample.x_t,
+            #     t=path_sample.t,
+            # )
+            # mask = audio_att_mask
+            # loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
 
-        # Apply mask to the loss
-        # if loss_weight_extra is not None:
-        #     w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
-        #     ce_m = ce[m]
-        #     w_m = w[m]
-        #     loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
-        # else:
-        #     loss = ce[m].mean()
-
-        # ---- Loss: CE or KOP-ELBO (mixture) ----
-        if self.loss_name == "kop_elbo":
-            # print("Using KOP-ELBO loss")
-            # per-position λ(t)
-            lam = self._lambda_weights(times_t, ref_tokens=x_1)        # [B, L]
-            lam_flat = lam.flatten(0, 1)
-            # optionally combine with provided pad/EOS weights
-            if loss_weight_extra is not None:
-                w_extra = loss_weight_extra.flatten(0, 1).float().to(ce.device)
-                w = lam_flat * w_extra
-            else:
-                w = lam_flat
-            # optional normalization to keep loss scale stable across schedules
-            # if self.lambda_normalize:
-            #     loss = self._reduce_loss_ce(ce, m, w)
-            # else:
-            # unnormalized weighted mean over masked
-            loss = (ce[m] * w[m]).mean()
+            loss = self.criteria(
+                logits=logits,
+                x_1=x_1,
+                x_t=path_sample.x_t,
+                t=path_sample.t,
+            ).mean()
         else:
-            flattened_audio_att_mask = audio_att_mask.flatten(0, 1).bool()
-            if loss_weight_extra is not None:
-                w = loss_weight_extra.flatten(0, 1).float().to(ce.device)
-                loss = self._reduce_loss_ce(ce, flattened_audio_att_mask, w)
-            else:
-                loss = ce[flattened_audio_att_mask].mean()
+            # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
+            target = x_1.masked_fill(~audio_att_mask.bool(), -100)
+            loss = self.criteria(
+                input=logits.view(-1, logits.size(-1)),
+                target=target.view(-1).long()
+            ).mean()
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -478,76 +471,65 @@ class DFMTTSWrapper(L.LightningModule):
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
         elif self.config.datasets.type == "offline" or \
-            self.config.datasets.type == "offline_dynamic_dur":
+            self.config.datasets.type == "offline_dynamic_dur" or \
+            self.config.datasets.type == "offline_voice_cloning_simplified":
             if len(batch) == 6:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
-            else:
+            elif len(batch) == 5:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
+            elif len(batch) == 4:
+                # x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
+                # x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
+
+                print("Batch with 4 elements detected. Sampling x_0 from source distribution.")
+                x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
+                x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
+                print(f"x_0 shape: {x_0.shape}")
+                print(x_0)
+            else:
+                raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
             t = torch.rand(x_1.shape[0], device=x_1.device)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
-            x_t = path_sample.x_t
-            times_t = path_sample.t
-
-            m_corrupt = (x_t != x_1) & audio_att_mask.bool()
-
         # print(f"TRAINER - VAL: {times_t}")
         logits = self(
-            x_t=x_t,
+            x_t=path_sample.x_t,
             text_ids=transcription_ids,
-            text_att_mask=transcription_att_mask,
-            time=times_t,
+            time=path_sample.t,
             drop_text=False,
+            audio_att_mask=audio_att_mask,
+            text_att_mask=transcription_att_mask,
         )
 
-        ce = self.criteria(logits.flatten(0, 1), x_1.flatten(0, 1).long())
-        # m  = mask.flatten(0, 1).bool()
-        # Apply mask to the loss
-        # if loss_weight_extra is not None:
-        #     w = loss_weight_extra.flatten(0, 1).float().to(ce.device)  # [B*L]
-        #     ce_m = ce[m]
-        #     w_m = w[m]
-        #     loss = (ce_m * w_m).sum() / (w_m.sum() + 1e-8)
-        # else:
-        #     loss = ce[m].mean()
-        # ---- Loss: CE or KOP-ELBO (mixture) ----
-        if self.loss_name == "kop_elbo":
-            m  = m_corrupt.flatten(0, 1).bool()
-            # per-position λ(t)
-            lam = self._lambda_weights(times_t, ref_tokens=x_1)        # [B, L]
-            lam_flat = lam.flatten(0, 1)
-            # optionally combine with provided pad/EOS weights
-            if loss_weight_extra is not None:
-                w_extra = loss_weight_extra.flatten(0, 1).float().to(ce.device)
-                w = lam_flat * w_extra
-            else:
-                w = lam_flat
-            # optional normalization to keep loss scale stable across schedules
-            # if self.lambda_normalize:
-            #     loss = self._reduce_loss_ce(ce, m, w)
-            # else:
-            # unnormalized weighted mean over masked
-            loss = (ce[m] * w[m]).mean()
+        if self.config.loss.function == "generalized_kl":
+            loss = self.criteria(
+                logits=logits,
+                x_1=x_1,
+                x_t=path_sample.x_t,
+                t=path_sample.t,
+            )
+            mask = audio_att_mask
+            loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
         else:
-            flattened_audio_att_mask = audio_att_mask.flatten(0, 1).bool()
-            if loss_weight_extra is not None:
-                w = loss_weight_extra.flatten(0, 1).float().to(ce.device)
-                loss = self._reduce_loss_ce(ce, flattened_audio_att_mask, w)
-            else:
-                loss = ce[flattened_audio_att_mask].mean()
+            # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
+            target = x_1.masked_fill(~audio_att_mask.bool(), -100)
+            loss = self.criteria(
+                input=logits.view(-1, logits.size(-1)),
+                target=target.view(-1).long()
+            ).mean()
 
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         if batch_idx == 0:
-            try:
-                self.sample_validation()
-            except Exception as e:
-                print(f"Error during validation sample generation: {e}")
-                wandb.log({"validation_sample": None})
-                pass
+            # try:
+            self.sample_validation()
+            # except Exception as e:
+            #     print(f"Error during validation sample generation: {e}")
+            #     wandb.log({"validation_sample": None})
+            #     pass
         return loss
 
     @torch.no_grad()
@@ -582,20 +564,12 @@ class DFMTTSWrapper(L.LightningModule):
 
         print(f"Codes reference shape: {codes_ref_size}")
 
-        # pad codes_ref to have the same length as the model's max_length
-        if codes_ref.size(0) < self.config.test.max_audio_length:
-            codes_ref = F.pad(
-                codes_ref,
-                (0, self.config.test.max_audio_length - codes_ref.size(0)),
-                value=self.config.datasets.audio_mask_token
-            )
-
         print(f"Padded codes reference shape: {codes_ref.shape}")
         codes_ref = codes_ref.unsqueeze(0).to(self.device)
 
         text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
 
-        vocab_size = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        vocab_size = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1 # -1 to exclude padding token
         max_length = self.config.test.max_audio_length
         generated_audios = {}
         # Iterate over each test sentence from config
@@ -611,8 +585,7 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"Initial codes_ref: {codes_ref.shape}, {torch.min(codes_ref)}, {torch.max(codes_ref)}")
             print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
 
-            if self.config.datasets.ref_drop_prob==0 and \
-                self.config.datasets.cond_drop_prob==0:
+            if self.config.datasets.cond_drop_prob==0.0:
                 print("\n\tUsing simple_generate_sample\n")
                 x_t = self.simple_generate_sample(
                     xt=x_t,
@@ -622,14 +595,25 @@ class DFMTTSWrapper(L.LightningModule):
                     codes_ref_size=codes_ref_size
                 )
             else:
-                print("\n\tUsing PFG generator\n")
-                x_t = self.generate_sample(
-                    xt=x_t,
-                    text_ids=text_ids,
-                    codes_ref=codes_ref,
-                    nsf=self.config.test.nsf,
-                    codes_ref_size=codes_ref_size
-                )
+                if self.config.source_dist_type == "mask":
+                    print("\n\tUsing PFG generator with Masked Source Distribution\n")
+                    x_t = self.generate_sample_pfg_mask(
+                        xt=x_t,
+                        text_ids=text_ids,
+                        codes_ref=codes_ref,
+                        nsf=self.config.test.nsf,
+                        codes_ref_size=codes_ref_size
+                    )
+                else:
+                    print("\n\tUsing PFG generator with Uniform Source Distribution\n")
+                    x_t = self.generate_sample_pfg_uniform(
+                        xt=x_t,
+                        text_ids=text_ids,
+                        codes_ref=codes_ref,
+                        nsf=self.config.test.nsf,
+                        codes_ref_size=codes_ref_size
+                    )
+
             generated_audio = audio_codec.decode_code(x_t)
             # Use a truncated version of the sentence for the log key (replace spaces with underscores)
             key = f"generated_audio_{idx}"
@@ -646,7 +630,7 @@ class DFMTTSWrapper(L.LightningModule):
         x1_temp = 1.0
         gamma = 2.5
         mask_token_id = self.config.datasets.audio_mask_token
-        S = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        S = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         eps = 1e-12
         noise = 0.0
 
@@ -704,87 +688,13 @@ class DFMTTSWrapper(L.LightningModule):
 
         return xt
 
-    def apply_vlg_ops(
-        self,
-        x: torch.Tensor,                  # [B, L]
-        mask_token: int,
-        expand_token: int,
-        delete_token: int,
-        max_len: int,
-        edit_start: int = 0,              # first editable index (e.g., codes_ref_size)
-        edit_end: Optional[int] = None,   # last editable index (exclusive); None => full length
-    ):
-        """
-        Variable-length growth (expand) & shrink (delete), applied ONLY in [edit_start, edit_end).
-        - <EXPAND>  -> replace with [MASK, MASK]
-        - <DELETE>  -> remove the nearest real LEFT neighbor *and* the <DELETE> itself (no mask appended)
-        Then re-pad with MASK to max_len (so new slots are fillable on later steps).
-        """
-        B, L = x.shape
-        SENTINELS = {mask_token, expand_token, delete_token}
-
-        out = []
-        for b in range(B):
-            seq = x[b].tolist()
-            if edit_end is None or edit_end > len(seq):
-                e_end = len(seq)
-            else:
-                e_end = edit_end
-
-            new_seq = []
-
-            # Copy prefix (non-editable head)
-            if edit_start > 0:
-                new_seq.extend(seq[:edit_start])
-
-            # Work on editable window
-            i = edit_start
-            while i < e_end:
-                t = seq[i]
-
-                # EXPAND: replace with two MASKs
-                if t == expand_token:
-                    new_seq.append(mask_token)
-                    new_seq.append(mask_token)
-                    i += 1
-                    continue
-
-                # DELETE: drop left real neighbor + the DELETE itself
-                if t == delete_token:
-                    # # find a real (non-sentinel) left neighbor inside the editable window *or* in prefix
-                    # j = len(new_seq) - 1
-                    # while j >= 0 and new_seq[j] in SENTINELS:
-                    #     j -= 1
-                    # if j >= 0:
-                    #     new_seq.pop(j)   # remove the real token
-                    # # skip the DELETE itself by not appending it
-                    i += 1
-                    continue
-
-                # Otherwise keep the token
-                new_seq.append(t)
-                i += 1
-
-            # Copy tail (non-editable)
-            if e_end < len(seq):
-                new_seq.extend(seq[e_end:])
-
-            # truncate then pad with MASK so new slots are fillable next steps
-            new_seq = new_seq[:max_len]
-            padded = [mask_token] * max_len
-            upto = min(len(new_seq), max_len)
-            padded[:upto] = new_seq[:upto]
-            out.append(torch.tensor(padded, device=x.device, dtype=x.dtype))
-
-        return torch.stack(out, dim=0)
-
-    def generate_sample(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+    def generate_sample_pfg_mask(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
         num_steps = nsf
         dt = 1.0 / num_steps
         x1_temp = 1.0
         gamma = 2.5
         mask_token_id = self.config.datasets.audio_mask_token
-        S = self.config.datasets.audio_vocab_size + self.config.model.add_token
+        S = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         eps = 1e-9
         noise = 0.0
 
@@ -905,4 +815,143 @@ class DFMTTSWrapper(L.LightningModule):
         xt = xt.unsqueeze(0).unsqueeze(0)
         print("Final Shape", xt.shape)
 
+        return xt
+
+    def generate_sample_pfg_uniform(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+        """
+        Discrete CTMC sampler with predictor-free guidance (uniform base).
+        Differences vs mask-absorbing:
+        - No special-case gating on mask tokens.
+        - Off-diagonal rates exist for every position at all times.
+        - Diagonal is set by negative row-sum of off-diagonals.
+        """
+        num_steps = nsf
+        dt = 1.0 / max(1, num_steps)
+        x1_temp = 1.0 # sampling temperature for logits -> probs
+        gamma = 2.5 # PFG guidance scale
+        S = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
+        eps = 1e-9
+        noise = 0.0
+
+        # Optional config shorthands for cleanup
+        mask_token_id   = getattr(self.config.datasets, "audio_mask_token", None)
+        eos_token_id    = getattr(self.config.datasets, "audio_eos_token", None)
+        pad_token_id    = getattr(self.config.datasets, "audio_pad_token", None)
+        expand_token_id = getattr(self.config.datasets, "audio_expand_token", None)
+        delete_token_id = getattr(self.config.datasets, "audio_delete_token", None)
+
+        # Force-reference (prefix) constraint
+        xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
+
+        # Create text att_mask (single sample)
+        text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
+
+        # Time loop
+        for step in tqdm(range(num_steps), total=num_steps):
+            t_val    = step * dt
+            t_tensor = xt.new_full((1,), t_val, dtype=torch.float32, device=self.device)
+
+            # ----- Unconditional pass -----
+            logits_u = self(
+                x_t=xt,
+                text_ids=text_ids,
+                text_att_mask=text_att_mask,
+                time=t_tensor,
+                drop_text=True,
+            )
+            probs_u = torch.softmax(logits_u / x1_temp, dim=-1)  # [B, T, S]
+
+            # ----- Conditional pass -----
+            logits_c = self(
+                x_t=xt,
+                text_ids=text_ids,
+                text_att_mask=text_att_mask,
+                time=t_tensor,
+                drop_text=False,
+            )
+            probs_c = torch.softmax(logits_c / x1_temp, dim=-1)  # [B, T, S]
+
+            # ban_ids = []
+            # for attr in ["audio_eos_token", "audio_expand_token", "audio_delete_token"]:
+            #     tid = getattr(self.config.datasets, attr, None)
+            #     if tid is not None:
+            #         ban_ids.append(int(tid))
+            # if ban_ids:
+            #     ban_mask = torch.zeros(S, device=xt.device, dtype=probs_u.dtype)
+            #     ban_mask[torch.tensor(ban_ids, device=xt.device)] = 1.0
+            #     # zero banned columns before removing the diagonal & renorm
+            #     probs_u = probs_u * (1.0 - ban_mask.view(1,1,S))
+            #     probs_c = probs_c * (1.0 - ban_mask.view(1,1,S))
+
+            # ----- Build uniform-base CTMC rates -----
+            # Hazard / noise-rate schedule
+            base_r = (1.0 + noise * t_val) / max(eps, (1.0 - t_val))  # scalar λ(t) > 0
+
+            # Remove self probability (no instantaneous self-jumps)
+            one_hot_cur = F.one_hot(xt, num_classes=S).float() # [B, T, S]
+            # Off-diagonal jump distributions (normalized):
+            off_u = probs_u * (1.0 - one_hot_cur)
+            off_u = off_u / off_u.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            off_c = probs_c * (1.0 - one_hot_cur)
+            off_c = off_c / off_c.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            # Convert to instantaneous rates
+            R_u = base_r * off_u # [B, T, S], off-diag ≥ 0
+            R_c = base_r * off_c
+
+            # ----- Predictor-free guidance (geometric mean of rates) -----
+            log_Ru = torch.log(R_u + eps)
+            log_Rc = torch.log(R_c + eps)
+            R_mix  = torch.exp(gamma * log_Rc + (1.0 - gamma) * log_Ru)  # off-diag rates
+
+            # Enforce CTMC row-sum zero by setting diagonal = -sum(off-diag)
+            # First, compute off-diagonal sum (zero out diagonal temporarily)
+            R_off = R_mix.clone()
+            R_off.scatter_(-1, xt[..., None], 0.0)
+            row_sum = R_off.sum(dim=-1, keepdim=True)
+            # Fill diagonal with negative row-sum
+            R = R_off.clone()
+            R.scatter_(-1, xt[..., None], -row_sum)
+
+            # ----- Euler step to a transition matrix P ≈ I + R*dt -----
+            # Build P using only off-diagonals from R_off and computed diagonal
+            P_off = (R_off * dt).clamp_min(0.0)
+            diag = (1.0 - P_off.sum(dim=-1, keepdim=True)).clamp_min(0.0)
+            P = P_off.clone()
+            P.scatter_(-1, xt[..., None], diag)
+
+            # Sample next state for each position independently
+            xt = torch.multinomial(P.view(-1, S), 1).view_as(xt)
+
+            # Force conditioning prefix after edits
+            # xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
+
+        # ----- Post-processing / cleanup -----
+        print("Final xt shape:", xt.shape)
+        xt = xt[..., codes_ref_size:]
+        print("Shape after removing codes_ref:", xt.shape)
+
+        xt = xt.squeeze(0)
+        print("Shape after squeeze:", xt.shape)
+
+        # Remove EOS/MASK/PAD/EXPAND/DELETE tokens if present
+        if eos_token_id is not None:
+            xt = xt[xt != eos_token_id]
+            print("Shape after eos removal:", xt.shape)
+        if mask_token_id is not None:
+            xt = xt[xt != mask_token_id]
+            print("Shape after mask removal:", xt.shape)
+        if pad_token_id is not None:
+            xt = xt[xt != pad_token_id]
+            print("Shape after pad removal:", xt.shape)
+        if expand_token_id is not None:
+            xt = xt[xt != expand_token_id]
+            print("Shape after expand removal:", xt.shape)
+        if delete_token_id is not None:
+            xt = xt[xt != delete_token_id]
+            print("Shape after delete removal:", xt.shape)
+
+        xt = xt.unsqueeze(0).unsqueeze(0)
+        print("Final Shape", xt.shape)
         return xt
