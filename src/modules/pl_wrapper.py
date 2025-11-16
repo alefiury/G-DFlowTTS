@@ -63,29 +63,35 @@ class DFMTTSWrapper(L.LightningModule):
         self.config = config
 
         if self.config.source_dist_type == "uniform":
+            print("\n\nUsing Uniform Source Distribution!\n\n")
             self.source_distribution = UniformSourceDistribution(
                 vocab_size=self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1
             ) # +audio_add_token - 1 because we don't want to sample the padding token
         elif self.config.source_dist_type == "mask":
+            print("\n\nUsing Masked Source Distribution!\n\n")
             self.source_distribution = MaskedSourceDistribution(
                 mask_token=self.config.datasets.audio_mask_token
             )
         else:
             raise ValueError(f"Invalid source distribution: {self.config.source_dist_type}")
 
-        if self.config.scheduler_type == "ko":
+        if self.config.get("scheduler_type", "polynomial") == "ko":
             print("\n\nUsing KO scheduler!\n\n")
             self.path = MixtureDiscreteProbPath(
                 scheduler=KOConvexScheduler()
             )
-        elif self.config.scheduler_type == "polynomial":
+        elif self.config.get("scheduler_type", "polynomial") == "polynomial":
             self.path = MixtureDiscreteProbPath(
                 scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
             )
         else:
             raise ValueError(f"Invalid scheduler type: {self.config.scheduler.type}")
 
-        self.criteria = get_loss_function(loss_function=self.config.loss.function, path=self.path)
+        try:
+            loss_function_name = self.config.loss.get("function", "cross_entropy")
+        except:
+            loss_function_name = "cross_entropy"
+        self.criteria = get_loss_function(loss_function=loss_function_name, path=self.path)
 
         if self.config.model_type.lower() == "dit_adaln":
             self.model = Transformer(**self.config.model)
@@ -407,16 +413,15 @@ class DFMTTSWrapper(L.LightningModule):
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
             elif len(batch) == 4:
-                print("Batch with 4 elements detected. Sampling x_0 from source distribution.")
                 x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
                 x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
-                print(f"x_0 shape: {x_0.shape}")
-                print(x_0)
             else:
                 raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
-            t = torch.rand(x_1.shape[0], device=x_1.device)
+            # Elbo may have singularity at 1
+            time_epsilon = 1e-3 if isinstance(self.criteria, MixturePathGeneralizedKL) else 0.0
+            t = torch.rand(x_1.shape[0], device=x_1.device) * (1.0 - time_epsilon)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
         if random.random() < self.config.datasets.cond_drop_prob:
@@ -436,24 +441,17 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text=drop_text,
             audio_att_mask=audio_att_mask,
             text_att_mask=transcription_att_mask,
-        )
+        ).float()
 
         if self.config.loss.function == "generalized_kl":
-            # loss = self.criteria(
-            #     logits=logits,
-            #     x_1=x_1,
-            #     x_t=path_sample.x_t,
-            #     t=path_sample.t,
-            # )
-            # mask = audio_att_mask
-            # loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
-
             loss = self.criteria(
                 logits=logits,
                 x_1=x_1,
                 x_t=path_sample.x_t,
                 t=path_sample.t,
-            ).mean()
+            )
+            mask = audio_att_mask
+            loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
@@ -479,19 +477,14 @@ class DFMTTSWrapper(L.LightningModule):
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask = batch
                 loss_weight_extra = None
             elif len(batch) == 4:
-                # x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
-                # x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
-
-                print("Batch with 4 elements detected. Sampling x_0 from source distribution.")
                 x_1, audio_att_mask, transcription_ids, transcription_att_mask = batch
                 x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
-                print(f"x_0 shape: {x_0.shape}")
-                print(x_0)
             else:
                 raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
-            t = torch.rand(x_1.shape[0], device=x_1.device)
+            time_epsilon = 1e-3 if isinstance(self.criteria, MixturePathGeneralizedKL) else 0.0
+            t = torch.rand(x_1.shape[0], device=x_1.device) * (1.0 - time_epsilon)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
 
         # print(f"TRAINER - VAL: {times_t}")
@@ -502,7 +495,7 @@ class DFMTTSWrapper(L.LightningModule):
             drop_text=False,
             audio_att_mask=audio_att_mask,
             text_att_mask=transcription_att_mask,
-        )
+        ).float()
 
         if self.config.loss.function == "generalized_kl":
             loss = self.criteria(
@@ -524,12 +517,12 @@ class DFMTTSWrapper(L.LightningModule):
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
         if batch_idx == 0:
-            # try:
-            self.sample_validation()
-            # except Exception as e:
-            #     print(f"Error during validation sample generation: {e}")
-            #     wandb.log({"validation_sample": None})
-            #     pass
+            try:
+                self.sample_validation()
+            except Exception as e:
+                print(f"Error during validation sample generation: {e}")
+                wandb.log({"validation_sample": None})
+                pass
         return loss
 
     @torch.no_grad()
@@ -627,15 +620,8 @@ class DFMTTSWrapper(L.LightningModule):
     def simple_generate_sample(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
         num_steps = nsf
         dt = 1.0 / num_steps
-        x1_temp = 1.0
-        gamma = 2.5
-        mask_token_id = self.config.datasets.audio_mask_token
         S = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         eps = 1e-12
-        noise = 0.0
-
-        mask_one_hot = torch.zeros((S), device=self.device)
-        mask_one_hot[mask_token_id] = 1.0
 
         xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
 
@@ -643,11 +629,13 @@ class DFMTTSWrapper(L.LightningModule):
         text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
 
         # Loop over the time grid
-        for step in tqdm(range(num_steps), total=num_steps):
-            t_val    = step * dt
+        for step in tqdm(range(nsf), total=nsf):
+            t_val    = step / num_steps
             t_tensor = xt.new_full((1,), t_val, dtype=torch.float32, device=self.device)
+
             # print(f"\n\n\t SIZE S: {S} | {xt.shape} | {torch.min(xt)}, {torch.max(xt)}")
             assert torch.min(xt) >= 0 and torch.max(xt) < S, f"xt values should be in [0, {S}), but got min {torch.min(xt)} and max {torch.max(xt)}"
+
             # Get Conditional Logits
             logits = self(
                 x_t=xt,
@@ -663,18 +651,30 @@ class DFMTTSWrapper(L.LightningModule):
                 badmax = int(xt.max().item()); badmin = int(xt.min().item())
                 raise RuntimeError(f"xt out of [0,{S-1}]: min={badmin} max={badmax}")
             p1 = torch.softmax(logits, dim=-1)
-            one_hot_x_t = torch.nn.functional.one_hot(xt, num_classes=S).float()
-            # Compute the velocity update using the denoiser formulation
-            # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
-            # u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
+
+            # Avoid numerical issues
+            if step == nsf - 1:
+                xt = torch.distributions.Categorical(p1).sample()
+                xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+                break
+
             sched = self.path.scheduler(t_tensor)
             kappa = sched.alpha_t.item()
             dkappa = sched.d_alpha_t.item()
-            u = (dkappa / (1.0 - kappa + eps)) * (p1 - one_hot_x_t)
+            one_hot_x_t = torch.nn.functional.one_hot(xt, num_classes=S).float()
+
+            # Compute the velocity update using the denoiser formulation
+            # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
+            # u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
+            u = (dkappa / (1.0 - kappa).clamp_min(eps)) * (p1 - one_hot_x_t)
+
             # Euler update: compute new probabilities and sample the updated state
-            new_probs = one_hot_x_t + dt * u
-            new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
+            new_probs = (one_hot_x_t + dt * u).clamp_min(0)
+            new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+
             xt = torch.distributions.Categorical(probs=new_probs).sample()
+            xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
         # remove making tokens from the generated sequence
         xt = xt.squeeze(0)
         xt = xt[xt != self.config.datasets.audio_mask_token]
@@ -871,17 +871,17 @@ class DFMTTSWrapper(L.LightningModule):
             )
             probs_c = torch.softmax(logits_c / x1_temp, dim=-1)  # [B, T, S]
 
-            # ban_ids = []
-            # for attr in ["audio_eos_token", "audio_expand_token", "audio_delete_token"]:
-            #     tid = getattr(self.config.datasets, attr, None)
-            #     if tid is not None:
-            #         ban_ids.append(int(tid))
-            # if ban_ids:
-            #     ban_mask = torch.zeros(S, device=xt.device, dtype=probs_u.dtype)
-            #     ban_mask[torch.tensor(ban_ids, device=xt.device)] = 1.0
-            #     # zero banned columns before removing the diagonal & renorm
-            #     probs_u = probs_u * (1.0 - ban_mask.view(1,1,S))
-            #     probs_c = probs_c * (1.0 - ban_mask.view(1,1,S))
+            ban_ids = []
+            for attr in ["audio_pad_token"]:
+                tid = getattr(self.config.datasets, attr, None)
+                if tid is not None:
+                    ban_ids.append(int(tid))
+            if ban_ids:
+                ban_mask = torch.zeros(S, device=xt.device, dtype=probs_u.dtype)
+                ban_mask[torch.tensor(ban_ids, device=xt.device)] = 1.0
+                # zero banned columns before removing the diagonal & renorm
+                probs_u = probs_u * (1.0 - ban_mask.view(1,1,S))
+                probs_c = probs_c * (1.0 - ban_mask.view(1,1,S))
 
             # ----- Build uniform-base CTMC rates -----
             # Hazard / noise-rate schedule
@@ -925,7 +925,7 @@ class DFMTTSWrapper(L.LightningModule):
             xt = torch.multinomial(P.view(-1, S), 1).view_as(xt)
 
             # Force conditioning prefix after edits
-            # xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
+            xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
 
         # ----- Post-processing / cleanup -----
         print("Final xt shape:", xt.shape)

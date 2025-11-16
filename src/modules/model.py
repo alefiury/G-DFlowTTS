@@ -171,10 +171,10 @@ class DDiTBlock(nn.Module):
 
         q, k, v = (item.transpose(1, 2) for item in (q, k, v))
         x = F.scaled_dot_product_attention(
-            query=q, 
-            key=k, 
-            value=v, 
-            # attn_mask=att_mask
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=att_mask
         )
         x = rearrange(x, "b h s d -> b s (h d)", b=batch_size)
 
@@ -231,6 +231,7 @@ class Transformer(nn.Module):
         audio_pad_token: Optional[int] = 65538,
         text_pad_token: Optional[int] = 0,
         text_filler_token: Optional[int] = 6681,
+        **kwargs,
     ):
         super().__init__()
         true_audio_vocab_size = audio_vocab_size + audio_add_token

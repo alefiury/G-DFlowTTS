@@ -53,6 +53,11 @@ def main() -> None:
         type=str,
         default=None
     )
+    parser.add_argument(
+        "--continue-training",
+        action="store_true",
+        help="Whether to continue training from the latest checkpoint in the checkpoint directory"
+    )
 
     args = parser.parse_args()
 
@@ -97,7 +102,7 @@ def main() -> None:
         LearningRateMonitor("step"),
     ]
 
-    if args.pretrained_checkpoint is not None:
+    if args.pretrained_checkpoint is not None and not args.continue_training:
         print("*"*100)
         print("Fine-tuning from checkpoint:", args.pretrained_checkpoint)
         model = DFMTTSWrapper.load_from_checkpoint(args.pretrained_checkpoint, config=config)
@@ -127,7 +132,13 @@ def main() -> None:
             default_root_dir=os.path.join(args.checkpoint_dir, config["title"])
         )
 
-    trainer.fit(model)
+    if args.continue_training:
+        print("*"*100)
+        print("Continuing training from the latest checkpoint in:", args.pretrained_checkpoint)
+        latest_checkpoint = args.pretrained_checkpoint
+        trainer.fit(model, ckpt_path=latest_checkpoint)
+    else:
+        trainer.fit(model)
 
 
 if __name__ == "__main__":
