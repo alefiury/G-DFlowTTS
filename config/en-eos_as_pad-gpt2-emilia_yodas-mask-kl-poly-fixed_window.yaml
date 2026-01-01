@@ -1,13 +1,19 @@
-title: DFMTTS-EmiliaYodas-NeuCodec-EOS_as_PAD-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(Steps-${trainer.max_steps})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-EmiliaYodas-NeuCodec-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
 model_type: "dit_adaln"
-# source_dist_type: "uniform"
 source_dist_type: "mask"
+scheduler_type: "polynomial" # "ko" or "polynomial"
+
+loss:
+    function: "cross_entropy"
+    # function: "generalized_kl"
 
 datasets:
-    type: "offline"
+    type: "hf_text_tokenizer"
+
+    text_tokenizer_name: "openai-community/gpt2"
 
     train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
     val_metadata: ""
@@ -18,33 +24,26 @@ datasets:
     max_audio_duration: 41
 
     vocab_file: "/raid/aluno_alef/DFM-TTS-2/config/vocab.json"
-    audio_codec: "HKUSTAudio/xcodec2"
-    speech_processor: "facebook/w2v-bert-2.0"
+    codec_name: "neucodec"
     max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
 
-    codec_name: "neucodec"
-
-    n: 3
-
-    text_vocab_size: 6681
+    text_vocab_size: 50257
     audio_vocab_size: 65536
 
-    text_pad_token: 0
+    text_filler_token: 50257
 
-    audio_mask_token: 65536
-    audio_eos_token: 65537
+    audio_eos_token: 65536
+    audio_mask_token: 65537
 
     mask_prob: [0.0, 1.0]
 
     use_mask: true
-    mask_type: "random"
-    audio_pad_type: "variable"
+    audio_pad_type: "fixed"
 
-    ref_drop_prob: 0.0
-    cond_drop_prob: 0.1 # text drop prob
+    cond_drop_prob: 0.0 # text drop prob
 
     assert_drop_prob: true
-    guidance_scale: 2.5
+    guidance_scale: 0.0
 
     use_eos_as_pad: true
     loss_on_eos_pad: false
@@ -55,9 +54,13 @@ model:
     hidden_size: 768
     cond_dim: 128
     n_heads: 12
-    n_blocks: 12
     dropout: 0.1
-    add_token: 2
+    n_blocks: 12
+    audio_add_token: 2 # eos + mask token
+    text_add_token: 1 # filler token
+    audio_pad_token:
+    text_pad_token:
+    text_filler_token: ${datasets.text_filler_token}
 
 train:
     batch_size: 32
@@ -81,13 +84,14 @@ scheduler:
 trainer:
     accelerator: "gpu"
     max_steps: 1000000
+    # max_epochs: 3
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
     val_check_interval: 50000
-    accumulate_grad_batches: 4
+    accumulate_grad_batches: 1
     precision: bf16
 
 model_checkpoint:
@@ -103,7 +107,7 @@ model_checkpoint:
 test:
     log_audio_ref: true
     nsf: 256
-    max_audio_length: 1024
+    max_audio_length: 2048
     audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
     text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
     sentences:
@@ -118,6 +122,6 @@ tags:
     - Discrete Flow Matching
     - Neucodec
     - EN
-    - ${trainer.max_steps}-max_steps
+    - GPT2-Tokenization
     - ${train.batch_size}-BS
     - LR-${optimizer.params.learning_rate}

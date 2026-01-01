@@ -1,0 +1,128 @@
+title: DFMTTS-EmiliaYodas-NeuCodec-${source_dist_type}-${loss.function}-Text_CFG-(Dist-${source_dist_type})-(MaskType-${datasets.mask_type})-(PadType-${datasets.audio_pad_type})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+wandb_project_name: "DFM-TTS"
+wandb_entity: "alefiury"
+
+model_type: "dit_adaln"
+# source_dist_type: "uniform"
+source_dist_type: "mask"
+scheduler_type: "ko" # "ko" or "polynomial"
+
+loss:
+    function: "cross_entropy"
+    # function: "generalized_kl"
+
+datasets:
+    type: "offline_voice_cloning_simplified"
+
+    train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
+    val_metadata: ""
+    base_dir: ""
+    filepath_column: "filepath"
+
+    sampling_rate: 16000
+    max_audio_duration: 41
+
+    vocab_file: "/raid/aluno_alef/DFM-TTS-2/config/vocab.json"
+    codec_name: "neucodec"
+    max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
+
+    text_vocab_size: 6681
+    audio_vocab_size: 65536
+
+    text_pad_token: 0
+    text_filler_token: 6681
+
+    audio_eos_token: 65536
+    audio_pad_token: 65537
+    audio_mask_token: 65538
+
+    mask_prob: [0.0, 1.0]
+
+    use_mask: true
+    mask_type: "random"
+    audio_pad_type: "variable"
+
+    cond_drop_prob: 0.1 # text drop prob
+
+    assert_drop_prob: true
+    guidance_scale: 2.5
+
+    use_eos_as_pad: false
+    loss_on_eos_pad: false
+
+model:
+    audio_vocab_size: ${datasets.audio_vocab_size}
+    text_vocab_size: ${datasets.text_vocab_size}
+    hidden_size: 768
+    cond_dim: 128
+    n_heads: 12
+    dropout: 0.1
+    n_blocks: 12
+    audio_add_token: 3 # eos + padding tokens + mask token
+    text_add_token: 1 # filler token
+    audio_pad_token: ${datasets.audio_pad_token}
+    text_pad_token: ${datasets.text_pad_token}
+    text_filler_token: ${datasets.text_filler_token}
+
+train:
+    batch_size: 32
+    shuffle: True
+    num_workers: 12
+
+optimizer:
+    name: "adamw"
+    params:
+        min_learning_rate: 1e-4
+        learning_rate: 3e-4
+        eps: 1e-8
+        weight_decay: 1e-6
+        betas: [0.9, 0.999]
+
+scheduler:
+    name: "CosineWarmupLR"
+    params:
+        warmup_lr: 5000
+
+trainer:
+    accelerator: "gpu"
+    # max_steps: 1000000
+    max_epochs: 3
+    num_sanity_val_steps: 2
+    overfit_batches: 0.0
+    log_every_n_steps: 10
+    gradient_clip_val: 10.0
+    gradient_clip_algorithm: "norm"
+    val_check_interval: 50000
+    accumulate_grad_batches: 4
+    precision: bf16
+
+model_checkpoint:
+    mode: "min"
+    save_top_k: 2
+    save_last: true
+    save_weights_only: false
+    every_n_train_steps: 10000
+    monitor: "val/loss_epoch"
+    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS"
+    filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
+
+test:
+    log_audio_ref: true
+    nsf: 256
+    max_audio_length: 1024
+    audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
+    sentences:
+        - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"
+        - "There is no way, however, to eliminate the possibility of the fibers having come from another identical shirt, end quote"
+        - "Oswald's Marine training in marksmanship, his other rifle experience and his established familiarity with this particular weapon"
+        - "Nevertheless, she attempted to commit suicide by driving her nails, purposely left long, into her throat."
+        - "His being was like an all sided lens concentrating all joys in the one heart of his consciousness."
+        - "When he reached Mary's shop, he turned into the court to the kitchen door."
+
+tags:
+    - Discrete Flow Matching
+    - Neucodec
+    - EN
+    - ${train.batch_size}-BS
+    - LR-${optimizer.params.learning_rate}

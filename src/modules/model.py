@@ -226,32 +226,32 @@ class Transformer(nn.Module):
         n_heads: int,
         dropout: int,
         n_blocks: int,
-        audio_add_token: int = 2, # mask + padding tokens
-        text_add_token: int = 1, # filler token
-        audio_pad_token: Optional[int] = 65538,
-        text_pad_token: Optional[int] = 0,
-        text_filler_token: Optional[int] = 6681,
+        audio_add_token: int, # mask + padding tokens
+        text_add_token: int, # filler token
+        audio_pad_token: Optional[int] = None, # padding token
+        text_pad_token: Optional[int] = None, # padding token
+        text_filler_token: Optional[int] = None, # filler token
         **kwargs,
     ):
         super().__init__()
         true_audio_vocab_size = audio_vocab_size + audio_add_token
         true_text_vocab_size = text_vocab_size + text_add_token
 
-        assert audio_pad_token < true_audio_vocab_size, \
-            f"audio_pad_token ({audio_pad_token}) must be less than audio_vocab_size + audio_add_token ({true_audio_vocab_size})"
-        assert text_pad_token < true_text_vocab_size, \
-            f"text_pad_token ({text_pad_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
-        assert text_filler_token < true_text_vocab_size, \
-            f"text_filler_token ({text_filler_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
+        # assert audio_pad_token not None and audio_pad_token < true_audio_vocab_size, \
+        #     f"audio_pad_token ({audio_pad_token}) must be less than audio_vocab_size + audio_add_token ({true_audio_vocab_size})"
+        # assert text_pad_token not None and text_pad_token < true_text_vocab_size, \
+        #     f"text_pad_token ({text_pad_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
+        # assert text_filler_token not None and text_filler_token < true_text_vocab_size, \
+        #     f"text_filler_token ({text_filler_token}) must be less than text_vocab_size + text_add_token ({true_text_vocab_size})"
 
         self.text_vocab_size = text_vocab_size
         self.text_pad_token = text_pad_token
         self.text_filler_token = text_filler_token
 
         # + audio_add_token to account for the mask and padding tokens
-        self.audio_embed = nn.Embedding(true_audio_vocab_size, hidden_size, padding_idx=audio_pad_token)
+        self.audio_embed = nn.Embedding(true_audio_vocab_size, hidden_size)
         # + 1 to account for the filler token
-        self.text_embed = nn.Embedding(true_text_vocab_size, hidden_size, padding_idx=text_pad_token)
+        self.text_embed = nn.Embedding(true_text_vocab_size, hidden_size)
 
         self.time_embedding = TimestepEmbedder(hidden_size=cond_dim)
         self.rotary_emb = rotary.Rotary(dim=hidden_size // n_heads)

@@ -29,6 +29,9 @@ from modules.pl_wrapper import DFMTTSWrapper
 from modules.dp_wrapper import DurationPredictorWrapper
 from utils.tokenizer import VoiceBpeTokenizer
 
+from flow_matching.path import MixtureDiscreteProbPath, ProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+
 
 class MaskedSourceDistribution():
     def __init__(self, mask_token: int) -> None:
@@ -81,6 +84,10 @@ def kappa_and_dot(t: torch.Tensor, kind: str = "cubic", a: float = 0.0, b: float
         return linear_kappa(t), linear_kappa_dot(t)
     else:
         raise ValueError(f"Unknown kappa kind: {kind}")
+
+SCHEDULER_PATH = MixtureDiscreteProbPath(
+    scheduler=PolynomialConvexScheduler(n=1.0)
+)
 
 
 def corrector_alpha_beta(

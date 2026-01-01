@@ -32,6 +32,9 @@ from modules.pl_wrapper import DFMTTSWrapper
 from modules.dp_wrapper import DurationPredictorWrapper
 from utils.tokenizer import VoiceBpeTokenizer
 
+from flow_matching.path import MixtureDiscreteProbPath
+from modules.flow import KOConvexScheduler
+
 
 class MaskedSourceDistribution():
     def __init__(self, mask_token: int) -> None:
@@ -65,11 +68,22 @@ def get_remaining_duration(
     return torch.argmax(remaining_duration[:, -1], dim=-1).item()
 
 
+DISCRETE_PATH = MixtureDiscreteProbPath(
+    scheduler=KOConvexScheduler()
+)
+
+
 def cubic_kappa(t: torch.Tensor, a: float = 0.0, b: float = 2.0) -> torch.Tensor:
     return (-2*t**3 + 3*t**2 + a*(t**3 - 2*t**2 + t) + b*(t**3 - t**2)).clamp(0.0, 1.0)
 
 def cubic_kappa_dot(t: torch.Tensor, a: float = 0.0, b: float = 2.0) -> torch.Tensor:
     return (-6*t**2 + 6*t + a*(3*t**2 - 4*t + 1) + b*(3*t**2 - 2*t))
+
+def ko_kappa(t: torch.Tensor) -> torch.Tensor:
+    return DISCRETE_PATH.scheduler(t).alpha_t.squeeze(0)
+
+def ko_kappa_dot(t: torch.Tensor) -> torch.Tensor:
+    return DISCRETE_PATH.scheduler(t).d_alpha_t.squeeze(0)
 
 def linear_kappa(t: torch.Tensor) -> torch.Tensor:
     return t
@@ -82,6 +96,8 @@ def kappa_and_dot(t: torch.Tensor, kind: str = "cubic", a: float = 0.0, b: float
         return cubic_kappa(t, a, b), cubic_kappa_dot(t, a, b)
     elif kind == "linear":
         return linear_kappa(t), linear_kappa_dot(t)
+    elif kind == "ko":
+        return ko_kappa(t), ko_kappa_dot(t)
     else:
         raise ValueError(f"Unknown kappa kind: {kind}")
 
@@ -144,7 +160,7 @@ def inference_pfg(
     # temperature scheduling (Eq.36 from discrete flow matching): T(t)=x1_temp*(1-t)^2
     use_dfm36_temp: bool = True,
     # Temporal Score Rescaling (TSR)
-    tsr_k: float = 0.93,                   # k>1 sharper / k<1 flatter; k=1 disables TSR
+    tsr_k: float = 1.0,                   # k>1 sharper / k<1 flatter; k=1 disables TSR
     tsr_sigma: float = 3.0,               # “σ” knob controlling when TSR kicks in
 ) -> torch.Tensor:
     """
@@ -165,7 +181,7 @@ def inference_pfg(
     text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
 
     # ---------- tokens / sizes ----------
-    S = int(config.datasets.audio_vocab_size + config.model.add_token)
+    S = int(config.datasets.audio_vocab_size + config.model.audio_add_token)
     mask_token_id = int(config.datasets.audio_mask_token)
     eos_token_id  = int(getattr(config.datasets, "audio_eos_token", -1))
     pad_token_id = None
@@ -509,10 +525,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb_id", type=str, default=None)
     parser.add_argument("--noise", type=float, default=0.0)
-    parser.add_argument("--guidance_scale", type=float, default=2.5)
-    parser.add_argument("--alpha_strength", type=float, default=20.0)
-    parser.add_argument("--kappa_kind", type=str, choices=["cubic", "linear"], default="cubic", help="Scheduler path κ(t): cubic or linear.")
-    parser.add_argument("--integrator", type=str, choices=["euler", "midpoint", "heun"], default="euler", help="CTMC integrator: Euler, Midpoint, or Heun.")
+    parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--alpha_strength", type=float, default=0.0)
+    parser.add_argument("--kappa_kind", type=str, choices=["cubic", "linear", "ko"], default="ko", help="Scheduler path κ(t): cubic or linear.")
+    parser.add_argument("--integrator", type=str, choices=["euler", "midpoint", "heun"], default="midpoint", help="CTMC integrator: Euler, Midpoint, or Heun.")
     args = parser.parse_args()
 
     base_dir = "/raid/aluno_alef/DFM-TTS-2/src"
@@ -526,7 +542,7 @@ def main():
     libri_speech_test_clean_metadata = "/raid/aluno_alef/DATASETS/LibriSpeech-test-clean-filtered.csv"
     integrator = args.integrator
 
-    pfg_list = ["m1ejk3am", "xcrhi3ra", "px8ocppp", "fkpl1tsp", "w1kigq88", "b9gp3yjn", "mnporf1f", "nsrtslsi"]
+    pfg_list = ["m1ejk3am", "xcrhi3ra", "px8ocppp", "fkpl1tsp", "w1kigq88", "b9gp3yjn", "mnporf1f", "nsrtslsi", "06hubfi8"]
 
     ################################################################################
     # select model to evaluate
@@ -600,9 +616,14 @@ def main():
 
     elif args.wandb_id == "nsrtslsi":
         print("\n\n\t Evaluating nsrtslsi: nsrtslsi multilingual BPE-PFG-en-eos_as_pad-pad_as_loss-cubic model \n\n")
-        output_dir = f"nsrtslsi-v2-70khours-emilia-yodas-tsr-librispeech-test-clean-filtered/nsrtslsi-multilingual-bpe-pfg-en-eos_as_pad-pad_as_loss-cubic-corrector-use_oracle_length_{use_oracle_length}-noise_{noise}-guidance_scale_{guidance_scale}-alpha_strength_{alpha_strength}-kappa_kind_{kappa_kind}-integrator_{integrator}"
+        output_dir = f"70khours-emilia-yodas-tsr-librispeech-test-clean-filtered/nsrtslsi-multilingual-bpe-pfg-en-eos_as_pad-pad_as_loss-cubic-corrector-use_oracle_length_{use_oracle_length}-noise_{noise}-guidance_scale_{guidance_scale}-alpha_strength_{alpha_strength}-kappa_kind_{kappa_kind}-integrator_{integrator}"
         config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-eos_as_pad-en-emilia_yodas.yaml"
         pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/nsrtslsi/checkpoints/epoch=02-step=530000-val/loss_epoch=2.715.ckpt"
+    elif args.wandb_id == "06hubfi8":
+        print("\n\n\t Evaluating 06hubfi8: 06hubfi8 multilingual BPE-PFG-en-eos_as_pad-pad_as_loss-cubic model \n\n")
+        output_dir = f"MASKING-KO-emilia-yodas-tsr-librispeech-test-clean-filtered/06hubfi8-multilingual-bpe-pfg-en-eos_as_pad-pad_as_loss-cubic-corrector-use_oracle_length_{use_oracle_length}-noise_{noise}-guidance_scale_{guidance_scale}-alpha_strength_{alpha_strength}-kappa_kind_{kappa_kind}-integrator_{integrator}"
+        config_path = "/raid/aluno_alef/DFM-TTS-2/config/offline-bpe-text_cfg-eos_as_pad-en-emilia_yodas_ko_mask.yaml"
+        pretrained_checkpoint = "/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/06hubfi8/checkpoints/epoch=01-step=300000-val/loss_epoch=1.728.ckpt"
     else:
         raise ValueError("Invalid wandb_id. Please provide a valid wandb_id.")
 
@@ -668,75 +689,65 @@ def main():
 
             print(f"\n\nOracle length: {oracle_length}\n\n")
 
-
-        oracle_length = 2048
-
         for n in tqdm(nsf):
-            output_filepath = os.path.join(base_dir, output_dir, f"audio_{idx}-{n}.wav")
-            if os.path.exists(output_filepath):
-                # print(f"File {output_filepath} already exists, skipping...")
+            try:
+                output_filepath = os.path.join(base_dir, output_dir, f"audio_{idx}-{n}.wav")
+                if os.path.exists(output_filepath):
+                    # print(f"File {output_filepath} already exists, skipping...")
+                    continue
+
+                if args.wandb_id in pfg_list:
+                    print("\n\nUsing PFG inference...\n\n")
+                    x_t = inference_pfg(
+                        config=config,
+                        model=model,
+                        duration_model=duration_model,
+                        tokenizer=tokenizer,
+                        sentence=text,
+                        nsf=n,
+                        text_ref=text_ref,
+                        codes_ref=codes_ref.squeeze(0),
+                        device=device,
+                        sequence_length=oracle_length if use_oracle_length else None,
+                        noise=noise,
+                        guidance_scale=guidance_scale,
+                        alpha_strength=alpha_strength,
+                        kappa_kind=kappa_kind,
+                        integrator=args.integrator,
+                    )
+                else:
+                    x_t = inference(
+                        config=config,
+                        model=model,
+                        duration_model=duration_model,
+                        tokenizer=tokenizer,
+                        sentence=text,
+                        nsf=n,
+                        text_ref=text_ref,
+                        codes_ref=codes_ref,
+                        device=device,
+                        sequence_length=oracle_length if use_oracle_length else None,
+                    )
+                # remove making tokens from the generated sequence
+                x_t = x_t.squeeze(0)
+                x_t = x_t[codes_ref.shape[-1]:]
+
+                print(f"\n\n1 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
+
+                x_t = x_t[x_t != config.datasets.audio_eos_token]
+                x_t = x_t[x_t != config.datasets.audio_mask_token]
+
+                print(f"\n\n2 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
+                # remove padding tokens from the generated sequence
+                if hasattr(config.datasets, "audio_pad_token"):
+                    x_t = x_t[x_t != config.datasets.audio_pad_token]
+                x_t = x_t.unsqueeze(0).unsqueeze(0)
+                # Decode the final token sequence into an audio waveform
+                generated_audio = audio_codec.decode_code(x_t.long().to(device))
+                torchaudio.save(output_filepath, generated_audio.squeeze(0).cpu(), saving_sr)
+            except Exception as e:
+                print(f"Error processing row {idx}: {e}")
                 continue
-
-            if args.wandb_id in pfg_list:
-                print("\n\nUsing PFG inference...\n\n")
-                x_t = inference_pfg(
-                    config=config,
-                    model=model,
-                    duration_model=duration_model,
-                    tokenizer=tokenizer,
-                    sentence=text,
-                    nsf=n,
-                    text_ref=text_ref,
-                    codes_ref=codes_ref.squeeze(0),
-                    device=device,
-                    sequence_length=oracle_length if use_oracle_length else None,
-                    noise=noise,
-                    guidance_scale=guidance_scale,
-                    alpha_strength=alpha_strength,
-                    kappa_kind=kappa_kind,
-                    integrator=args.integrator,
-                )
-            else:
-                x_t = inference(
-                    config=config,
-                    model=model,
-                    duration_model=duration_model,
-                    tokenizer=tokenizer,
-                    sentence=text,
-                    nsf=n,
-                    text_ref=text_ref,
-                    codes_ref=codes_ref,
-                    device=device,
-                    sequence_length=oracle_length if use_oracle_length else None,
-                )
-            # remove making tokens from the generated sequence
-            x_t = x_t.squeeze(0)
-            x_t = x_t[codes_ref.shape[-1]:]
-
-            eos_token_id = getattr(config.datasets, "audio_eos_token", None)
-
-            # check if eos_token_id is in the generated sequence and remove it and all subsequent tokens
-            if eos_token_id is not None:
-                eos_indices = (x_t == eos_token_id).nonzero(as_tuple=True)[0]
-                if eos_indices.numel() > 0:
-                    x_t = x_t[:eos_indices[0]]
-            print("="*100)
-            print(f"\n\n1 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
-
-            x_t = x_t[x_t != config.datasets.audio_eos_token]
-            x_t = x_t[x_t != config.datasets.audio_mask_token]
-
-            print(f"\n\n2 - Generated codes shape: {x_t.shape} | ref codes shape: {codes_ref.shape} | oracle length: {oracle_length}\n\n")
-            # remove padding tokens from the generated sequence
-            if hasattr(config.datasets, "audio_pad_token"):
-                x_t = x_t[x_t != config.datasets.audio_pad_token]
-            x_t = x_t.unsqueeze(0).unsqueeze(0)
-            # Decode the final token sequence into an audio waveform
-            generated_audio = audio_codec.decode_code(x_t.long().to(device))
-            torchaudio.save(output_filepath, generated_audio.squeeze(0).cpu(), saving_sr)
-        # except Exception as e:
-        #     print(f"Error processing row {idx}: {e}")
-        #     continue
 
 
 if __name__ == "__main__":

@@ -118,7 +118,6 @@ def main() -> None:
             logger=logger,
             callbacks=callbacks,
             devices=args.gpus,
-            # precision="bf16",
             strategy=DDPStrategy(process_group_backend="gloo", find_unused_parameters=True),
             default_root_dir=os.path.join(args.checkpoint_dir, config["title"])
         )
@@ -128,7 +127,6 @@ def main() -> None:
             logger=logger,
             callbacks=callbacks,
             devices=[args.gpu],
-            # precision="bf16",
             default_root_dir=os.path.join(args.checkpoint_dir, config["title"])
         )
 

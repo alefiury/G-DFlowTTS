@@ -283,7 +283,7 @@ def inference_pfg(
         # training used UniformSourceDistribution(vocab_size=S-1) to avoid PAD
         xt = torch.randint(
             low=0,
-            high=S,
+            high=S-2,
             size=(1, total_len),
             device=device,
             dtype=torch.long,
@@ -721,15 +721,15 @@ def main():
     # inference params
     parser = argparse.ArgumentParser()
     parser.add_argument("--wandb_id", type=str, default=None)
-    parser.add_argument("--noise", type=float, default=0.3)
-    parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument("--noise", type=float, default=0.0)
+    parser.add_argument("--guidance_scale", type=float, default=2.5)
     parser.add_argument("--alpha_strength", type=float, default=20.0)
     parser.add_argument("--kappa_kind", type=str, choices=["cubic", "linear", "ko"], default="ko", help="Scheduler path κ(t): cubic or linear.")
     parser.add_argument("--integrator", type=str, choices=["euler", "midpoint", "heun"], default="euler", help="CTMC integrator: Euler, Midpoint, or Heun.")
     args = parser.parse_args()
 
     base_dir = "/raid/aluno_alef/DFM-TTS-2/src"
-    use_oracle_length = True
+    use_oracle_length = False
     nsf = [4, 8, 16, 32, 64, 128, 256, 512, 1024]
     # nsf = [1024]
     noise=args.noise
@@ -887,6 +887,9 @@ def main():
 
             print(f"\n\nOracle length: {oracle_length}\n\n")
 
+        oracle_length = 2048
+        use_oracle_length = True
+
         for n in tqdm(nsf):
             output_filepath = os.path.join(base_dir, output_dir, f"audio_{idx}-{n}.wav")
             if os.path.exists(output_filepath):
@@ -951,6 +954,17 @@ def main():
 
             # x_t = x_t[x_t != config.datasets.audio_eos_token]
             # x_t = x_t[x_t != config.datasets.audio_mask_token]
+
+            # check if eos_token_id is in the generated sequence and remove it and all subsequent tokens
+            eos_token_index = (x_t == eos_token_id).nonzero(as_tuple=True)[0]
+
+            print(eos_token_id)
+            print(x_t.tolist())
+
+            if eos_token_index.numel() > 0:
+                first_eos_index = eos_token_index[0].item()
+                x_t = x_t[:first_eos_index]
+                print("Shape after eos truncation:", x_t.shape)
 
             if eos_token_id is not None:
                 x_t = x_t[x_t != eos_token_id]

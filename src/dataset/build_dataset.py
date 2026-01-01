@@ -7,7 +7,11 @@ from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
 from utils.tokenizer import VoiceBpeTokenizer
-from dataset.dataloader import DynamicSingleSpeakerDataset, OfflineMultipleSpeakerDataset
+from dataset.dataloader import (
+    DynamicSingleSpeakerDataset,
+    OfflineMultipleSpeakerDataset,
+    HFTextTokenizerDataset
+)
 
 
 def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
@@ -30,7 +34,6 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
     print(f"Number of training samples: {len(train_df)}")
     print(f"Number of validation samples: {len(val_df)}")
 
-    text_tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
 
     if config.datasets.type == "dynamic":
         speech_processor = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
@@ -55,6 +58,8 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
     elif config.datasets.type == "offline" or \
         config.datasets.type == "offline_dynamic_dur" or \
         config.datasets.type == "offline_voice_cloning_simplified":
+        text_tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
+
         train_dataset = OfflineMultipleSpeakerDataset(
             data=train_df,
             base_dir=config.datasets.base_dir,
@@ -67,6 +72,17 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
             base_dir=config.datasets.base_dir,
             filepath_column=config.datasets.filepath_column,
             text_tokenizer=text_tokenizer,
+        )
+    elif config.datasets.type == "hf_text_tokenizer":
+        train_dataset = HFTextTokenizerDataset(
+            data=train_df,
+            base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
+        )
+        val_dataset = HFTextTokenizerDataset(
+            data=val_df,
+            base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
         )
     else:
         raise ValueError(f"Invalid dataset type: {config.datasets.type}")

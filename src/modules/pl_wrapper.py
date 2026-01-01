@@ -18,6 +18,7 @@ from lion_pytorch import Lion
 import torch.nn.functional as F
 from omegaconf import DictConfig
 from torch.optim import Adam, AdamW
+from transformers import AutoTokenizer
 from lightning.pytorch.utilities import grad_norm
 from xcodec2.modeling_xcodec2 import XCodec2Model
 from neucodec import NeuCodec
@@ -41,6 +42,7 @@ from dataset.dataloader import (
     OfflineMultipleSpeakerMaskCollateFunc,
     OfflineMultipleSpeakerDreamOnCollateFunc,
     OfflineVoiceCloningSimplifiedCollateFunc,
+    HFTextTokenizerCollator,
 )
 
 
@@ -65,8 +67,8 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.source_dist_type == "uniform":
             print("\n\nUsing Uniform Source Distribution!\n\n")
             self.source_distribution = UniformSourceDistribution(
-                vocab_size=self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1
-            ) # +audio_add_token - 1 because we don't want to sample the padding token
+                vocab_size=self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
+            )
         elif self.config.source_dist_type == "mask":
             print("\n\nUsing Masked Source Distribution!\n\n")
             self.source_distribution = MaskedSourceDistribution(
@@ -82,7 +84,7 @@ class DFMTTSWrapper(L.LightningModule):
             )
         elif self.config.get("scheduler_type", "polynomial") == "polynomial":
             self.path = MixtureDiscreteProbPath(
-                scheduler=PolynomialConvexScheduler(n=self.config.datasets.n)
+                scheduler=PolynomialConvexScheduler(n=1.0)
             )
         else:
             raise ValueError(f"Invalid scheduler type: {self.config.scheduler.type}")
@@ -167,7 +169,21 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
                 audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 text_pad_token=self.config.datasets.text_pad_token,
-                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
+        elif self.config.datasets.type == "hf_text_tokenizer":
+            print("\n\n\tUsing HF Text Tokenizer Collator for training dataloader!\n\n")
+
+            text_tokenizer = AutoTokenizer.from_pretrained(self.config.datasets.text_tokenizer_name)
+            if text_tokenizer.pad_token is None:
+                text_tokenizer.add_special_tokens({"pad_token": text_tokenizer.eos_token})
+
+            collate_fn = HFTextTokenizerCollator(
+                text_tokenizer=text_tokenizer,
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 audio_pad_type=self.config.datasets.audio_pad_type,
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
             )
@@ -228,7 +244,21 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
                 audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 text_pad_token=self.config.datasets.text_pad_token,
-                mask_type=self.config.datasets.mask_type,
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
+        elif self.config.datasets.type == "hf_text_tokenizer":
+            print("\n\n\tUsing HF Text Tokenizer Collator for validation dataloader!\n\n")
+
+            text_tokenizer = AutoTokenizer.from_pretrained(self.config.datasets.text_tokenizer_name)
+            if text_tokenizer.pad_token is None:
+                text_tokenizer.add_special_tokens({"pad_token": text_tokenizer.eos_token})
+
+            collate_fn = HFTextTokenizerCollator(
+                text_tokenizer=text_tokenizer,
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
                 audio_pad_type=self.config.datasets.audio_pad_type,
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
             )
@@ -404,9 +434,7 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.datasets.type == "dynamic":
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
-        elif self.config.datasets.type == "offline" or \
-            self.config.datasets.type == "offline_dynamic_dur" or \
-            self.config.datasets.type == "offline_voice_cloning_simplified":
+        else:
             if len(batch) == 6:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
             elif len(batch) == 5:
@@ -452,6 +480,17 @@ class DFMTTSWrapper(L.LightningModule):
             )
             mask = audio_att_mask
             loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
+
+            with torch.no_grad():
+                # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
+                ce_target = x_1.masked_fill(~audio_att_mask.bool(), -100)
+                aux_ce_loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    ce_target.view(-1).long(),
+                    ignore_index=-100,
+                    reduction="mean",
+                )
+            self.log("train/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
@@ -468,9 +507,7 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.datasets.type == "dynamic":
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
-        elif self.config.datasets.type == "offline" or \
-            self.config.datasets.type == "offline_dynamic_dur" or \
-            self.config.datasets.type == "offline_voice_cloning_simplified":
+        else:
             if len(batch) == 6:
                 x_1, transcription_ids, transcription_att_mask, x_0, audio_att_mask, loss_weight_extra = batch
             elif len(batch) == 5:
@@ -506,6 +543,16 @@ class DFMTTSWrapper(L.LightningModule):
             )
             mask = audio_att_mask
             loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
+
+            with torch.no_grad():
+                ce_target = x_1.masked_fill(~audio_att_mask.bool(), -100)
+                aux_ce_loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    ce_target.view(-1).long(),
+                    ignore_index=-100,
+                    reduction="mean",
+                )
+            self.log("train/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
@@ -522,7 +569,6 @@ class DFMTTSWrapper(L.LightningModule):
             except Exception as e:
                 print(f"Error during validation sample generation: {e}")
                 wandb.log({"validation_sample": None})
-                pass
         return loss
 
     @torch.no_grad()
@@ -560,7 +606,12 @@ class DFMTTSWrapper(L.LightningModule):
         print(f"Padded codes reference shape: {codes_ref.shape}")
         codes_ref = codes_ref.unsqueeze(0).to(self.device)
 
-        text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
+        if self.config.datasets.type == "hf_text_tokenizer":
+            text_tokenizer = AutoTokenizer.from_pretrained(self.config.datasets.text_tokenizer_name)
+            if text_tokenizer.pad_token is None:
+                text_tokenizer.add_special_tokens({"pad_token": text_tokenizer.eos_token})
+        else:
+            text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
 
         vocab_size = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1 # -1 to exclude padding token
         max_length = self.config.test.max_audio_length
@@ -569,7 +620,18 @@ class DFMTTSWrapper(L.LightningModule):
         for idx, sentence in tqdm(enumerate(self.config.test.sentences), total=len(self.config.test.sentences)):
             print(f"\nGenerating audio for sentence: {sentence}")
             augmented_sentence = text_ref + " " + sentence
-            text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en-us")).to(self.device).unsqueeze(0)
+
+            if isinstance(text_tokenizer, VoiceBpeTokenizer):
+                text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en-us")).to(self.device).unsqueeze(0)
+            else:
+                print("\n\nUsing HF AutoTokenizer for text encoding!\n\n")
+                text_ids = text_tokenizer(
+                    augmented_sentence,
+                    return_tensors="pt"
+                )["input_ids"].squeeze(0).to(self.device).unsqueeze(0)
+
+                print(text_ids)
+
             print(f"Text IDs: {text_ids.shape}", torch.min(text_ids), torch.max(text_ids))
             # Initialize xt with mask token (batch size = 1)
             x_t = self.source_distribution.sample((1, max_length), device=self.device)
@@ -579,8 +641,8 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
 
             if self.config.datasets.cond_drop_prob==0.0:
-                print("\n\tUsing simple_generate_sample\n")
-                x_t = self.simple_generate_sample(
+                print("\n\tUsing simple_generate_sample_ctmc\n")
+                x_t = self.simple_generate_sample_ctmc(
                     xt=x_t,
                     text_ids=text_ids,
                     codes_ref=codes_ref,
@@ -599,7 +661,7 @@ class DFMTTSWrapper(L.LightningModule):
                     )
                 else:
                     print("\n\tUsing PFG generator with Uniform Source Distribution\n")
-                    x_t = self.generate_sample_pfg_uniform(
+                    x_t = self.generate_sample_pfg_euler_uniform(
                         xt=x_t,
                         text_ids=text_ids,
                         codes_ref=codes_ref,
@@ -617,76 +679,200 @@ class DFMTTSWrapper(L.LightningModule):
             )
         wandb.log(generated_audios)
 
-    def simple_generate_sample(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+    @torch.no_grad()
+    def simple_generate_sample_paper(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
         num_steps = nsf
         dt = 1.0 / num_steps
         S = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         eps = 1e-12
 
-        xt[..., : codes_ref_size] = codes_ref[..., : codes_ref_size]
+        xt = xt.clone()
+        xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
 
-        # create text att_mask, all elements are "true" because we only have one sample
-        text_att_mask = text_ids.new_ones((1, text_ids.size(1)), dtype=torch.bool)
+        text_att_mask = torch.ones((xt.size(0), text_ids.size(1)), device=xt.device, dtype=torch.bool)
+        audio_att_mask = torch.ones_like(xt, device=xt.device, dtype=torch.bool)
 
-        # Loop over the time grid
-        for step in tqdm(range(nsf), total=nsf):
-            t_val    = step / num_steps
-            t_tensor = xt.new_full((1,), t_val, dtype=torch.float32, device=self.device)
+        pad_id = getattr(self.config.datasets, "audio_pad_token", None)
 
-            # print(f"\n\n\t SIZE S: {S} | {xt.shape} | {torch.min(xt)}, {torch.max(xt)}")
-            assert torch.min(xt) >= 0 and torch.max(xt) < S, f"xt values should be in [0, {S}), but got min {torch.min(xt)} and max {torch.max(xt)}"
+        for step in range(num_steps):
+            t_val = step / num_steps
+            t_tensor = torch.full((xt.size(0),), t_val, device=xt.device, dtype=torch.float32)
 
-            # Get Conditional Logits
             logits = self(
                 x_t=xt,
                 text_ids=text_ids,
                 text_att_mask=text_att_mask,
+                audio_att_mask=audio_att_mask,
                 time=t_tensor,
-                drop_text=False
-            )
+                drop_text=False,
+            ).float()
+
             if logits.size(-1) != S:
                 raise RuntimeError(f"logits classes {logits.size(-1)} != V_total {S}")
-            # Safety: xt must be < S for one_hot
-            if xt.max() >= S or xt.min() < 0:
-                badmax = int(xt.max().item()); badmin = int(xt.min().item())
-                raise RuntimeError(f"xt out of [0,{S-1}]: min={badmin} max={badmax}")
+
+            if pad_id is not None:
+                logits[..., int(pad_id)] = -torch.inf
+
             p1 = torch.softmax(logits, dim=-1)
 
-            # Avoid numerical issues
-            if step == nsf - 1:
-                xt = torch.distributions.Categorical(p1).sample()
+            # final step: sample directly from p_{1|t} (at t ~ 1 - 1/nsf)
+            if step == num_steps - 1:
+                xt = torch.distributions.Categorical(probs=p1).sample()
                 xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
                 break
 
             sched = self.path.scheduler(t_tensor)
-            kappa = sched.alpha_t.item()
-            dkappa = sched.d_alpha_t.item()
+            kappa  = sched.alpha_t          # tensor [B]
+            dkappa = sched.d_alpha_t        # tensor [B]
+
             one_hot_x_t = torch.nn.functional.one_hot(xt, num_classes=S).float()
 
-            # Compute the velocity update using the denoiser formulation
-            # Here, u = (p1 - one_hot_x_t) / (1 - t), note the small epsilon for numerical stability.
-            # u = (p1 - one_hot_x_t) / (1.0 - t_val + eps)
-            u = (dkappa / (1.0 - kappa).clamp_min(eps)) * (p1 - one_hot_x_t)
+            rate = (dkappa / (1.0 - kappa).clamp_min(eps)).view(-1, 1, 1)
+            u = rate * (p1 - one_hot_x_t)
 
-            # Euler update: compute new probabilities and sample the updated state
             new_probs = (one_hot_x_t + dt * u).clamp_min(0)
             new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
 
             xt = torch.distributions.Categorical(probs=new_probs).sample()
             xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
 
-        # remove making tokens from the generated sequence
+        # --- match your other samplers: remove the prompt prefix ---
+        xt = xt[..., codes_ref_size:]
+
+        # cleanup (consider truncating at first EOS instead of removing all EOS)
         xt = xt.squeeze(0)
         xt = xt[xt != self.config.datasets.audio_mask_token]
         if hasattr(self.config.datasets, "audio_eos_token"):
             xt = xt[xt != self.config.datasets.audio_eos_token]
-        # check if audio_pad_token exist in self.config.datasets
         if hasattr(self.config.datasets, "audio_pad_token"):
-            # remove padding tokens from the generated sequence
             xt = xt[xt != self.config.datasets.audio_pad_token]
-        xt = xt.unsqueeze(0).unsqueeze(0)
 
-        return xt
+        return xt.unsqueeze(0).unsqueeze(0)
+
+    @torch.no_grad()
+    def simple_generate_sample_ctmc(
+        self,
+        xt,
+        text_ids,
+        codes_ref,
+        nsf: int,
+        codes_ref_size: int,
+    ):
+        """
+        CTMC jump-or-stay sampler equivalent (up to helper details) to
+        flow_matching.solver.MixtureDiscreteEulerSolver with div_free = 0.
+
+        Key differences vs your Euler-on-simplex sampler:
+        - sample x1 ~ p_{1|t}
+        - build jump rates u = (dκ/(1-κ)) * 1[x == x1], then set u(x_t)=0
+        - jump with prob 1 - exp(-dt * intensity); if jump sample from u (normalized)
+        """
+        num_steps = int(nsf)
+        dt = 1.0 / max(num_steps, 1)
+        S = int(self.config.datasets.audio_vocab_size + self.config.model.audio_add_token)
+        eps = 1e-12
+
+        xt = xt.clone()
+        xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        # attention masks (adjust if you actually have padding)
+        text_att_mask = torch.ones(
+            (xt.size(0), text_ids.size(1)),
+            device=xt.device,
+            dtype=torch.bool,
+        )
+        audio_att_mask = torch.ones_like(xt, device=xt.device, dtype=torch.bool)
+
+        pad_id = getattr(self.config.datasets, "audio_pad_token", None)
+
+        for step in range(num_steps):
+            t_val = step / num_steps
+            t_tensor = torch.full(
+                (xt.size(0),),
+                t_val,
+                device=xt.device,
+                dtype=torch.float32,
+            )
+
+            logits = self(
+                x_t=xt,
+                text_ids=text_ids,
+                text_att_mask=text_att_mask,
+                audio_att_mask=audio_att_mask,
+                time=t_tensor,
+                drop_text=False,
+            ).float()
+
+            if logits.size(-1) != S:
+                raise RuntimeError(f"logits classes {logits.size(-1)} != V_total {S}")
+
+            # Prevent sampling PAD as x1 / final sample (optional, but usually desired)
+            if pad_id is not None:
+                logits[..., int(pad_id)] = -torch.inf
+
+            p1 = torch.softmax(logits, dim=-1)
+
+            # Final step: x_t <- x1 ~ p_{1|t}
+            if step == num_steps - 1:
+                xt = torch.distributions.Categorical(probs=p1).sample()
+                xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+                break
+
+            # --- CTMC step (MixtureDiscreteEulerSolver with div_free=0) ---
+
+            # 1) sample x1 ~ p_{1|t}(. | x_t)
+            x1 = torch.distributions.Categorical(probs=p1).sample()  # [B, T]
+
+            # 2) get scheduler values
+            sched = self.path.scheduler(t_tensor)
+            kappa = sched.alpha_t          # [B]
+            dkappa = sched.d_alpha_t       # [B]
+
+            rate = (dkappa / (1.0 - kappa).clamp_min(eps)).view(-1, 1, 1)  # [B,1,1]
+
+            # 3) build off-diagonal jump rates u
+            # u(x, x_t | x1) = rate * 1[x == x1], then set u(x_t)=0
+            delta1 = torch.nn.functional.one_hot(x1, num_classes=S).to(rate.dtype)  # [B,T,S]
+            u = rate * delta1  # [B,T,S]
+
+            # set u(x_t)=0 (no self-transition)
+            delta_t = torch.nn.functional.one_hot(xt, num_classes=S).to(torch.bool)  # [B,T,S]
+            u = torch.where(delta_t, torch.zeros_like(u), u)
+
+            # OPTIONAL but recommended: freeze prompt prefix so it never jumps
+            if codes_ref_size > 0:
+                u[:, :codes_ref_size, :] = 0.0
+
+            # 4) jump-or-stay
+            intensity = u.sum(dim=-1)  # [B,T]
+            # P(jump) = 1 - exp(-dt * intensity)
+            p_jump = 1.0 - torch.exp(-dt * intensity)
+            jump = torch.rand_like(p_jump) < p_jump  # [B,T] boolean
+
+            if jump.any():
+                # sample new token from u (normalized) at jumped positions
+                u_jump = u[jump]  # [N,S]
+                probs_jump = u_jump / u_jump.sum(dim=-1, keepdim=True).clamp_min(eps)
+                new_tokens = torch.distributions.Categorical(probs=probs_jump).sample()  # [N]
+                xt = xt.clone()
+                xt[jump] = new_tokens
+
+            # re-impose fixed prefix
+            xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        # --- match your other samplers: remove the prompt prefix ---
+        xt = xt[..., codes_ref_size:]
+
+        # cleanup (same as you had)
+        xt = xt.squeeze(0)
+        xt = xt[xt != self.config.datasets.audio_mask_token]
+        if hasattr(self.config.datasets, "audio_eos_token"):
+            xt = xt[xt != self.config.datasets.audio_eos_token]
+        if hasattr(self.config.datasets, "audio_pad_token"):
+            xt = xt[xt != self.config.datasets.audio_pad_token]
+
+        return xt.unsqueeze(0).unsqueeze(0)
+
 
     def generate_sample_pfg_mask(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
         num_steps = nsf
@@ -871,17 +1057,17 @@ class DFMTTSWrapper(L.LightningModule):
             )
             probs_c = torch.softmax(logits_c / x1_temp, dim=-1)  # [B, T, S]
 
-            ban_ids = []
-            for attr in ["audio_pad_token"]:
-                tid = getattr(self.config.datasets, attr, None)
-                if tid is not None:
-                    ban_ids.append(int(tid))
-            if ban_ids:
-                ban_mask = torch.zeros(S, device=xt.device, dtype=probs_u.dtype)
-                ban_mask[torch.tensor(ban_ids, device=xt.device)] = 1.0
-                # zero banned columns before removing the diagonal & renorm
-                probs_u = probs_u * (1.0 - ban_mask.view(1,1,S))
-                probs_c = probs_c * (1.0 - ban_mask.view(1,1,S))
+            # ban_ids = []
+            # for attr in ["audio_pad_token"]:
+            #     tid = getattr(self.config.datasets, attr, None)
+            #     if tid is not None:
+            #         ban_ids.append(int(tid))
+            # if ban_ids:
+            #     ban_mask = torch.zeros(S, device=xt.device, dtype=probs_u.dtype)
+            #     ban_mask[torch.tensor(ban_ids, device=xt.device)] = 1.0
+            #     # zero banned columns before removing the diagonal & renorm
+            #     probs_u = probs_u * (1.0 - ban_mask.view(1,1,S))
+            #     probs_c = probs_c * (1.0 - ban_mask.view(1,1,S))
 
             # ----- Build uniform-base CTMC rates -----
             # Hazard / noise-rate schedule
@@ -955,3 +1141,330 @@ class DFMTTSWrapper(L.LightningModule):
         xt = xt.unsqueeze(0).unsqueeze(0)
         print("Final Shape", xt.shape)
         return xt
+
+    @torch.no_grad()
+    def generate_sample_pfg_uniform_v2(self, xt, text_ids, codes_ref, nsf: int, codes_ref_size: int):
+        """
+        Uniform-source CTMC sampler with predictor-free guidance (PFG),
+        aligned with flow_matching scheduler:
+        lambda(t) = d_alpha_t / (1 - alpha_t)
+
+        Uses jump-probability tau-leap:
+        p_jump = 1 - exp(-dt * hazard)
+        if jump -> sample dest from R_off / hazard
+
+        IMPORTANT:
+        - Only makes sense if you trained with source_dist_type="uniform"
+        - Only use PFG if cond_drop_prob > 0 during training
+        """
+        num_steps = int(nsf)
+        dt = 1.0 / max(1, num_steps)
+
+        # knobs (consider exposing as args)
+        x1_temp = 1.0
+        guidance_scale = 2.5   # CFG-style scale (can be > 1)
+        eps = 1e-9
+
+        S = int(self.config.datasets.audio_vocab_size + self.config.model.audio_add_token)
+
+        mask_token_id = int(getattr(self.config.datasets, "audio_mask_token", -1))
+        eos_token_id  = int(getattr(self.config.datasets, "audio_eos_token", -1))
+
+        pad_token_id = getattr(self.config.datasets, "audio_pad_token", None)
+        pad_token_id = int(pad_token_id) if pad_token_id is not None else None
+
+        # pin prefix
+        xt = xt.clone()
+        xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        text_att_mask = text_ids.new_ones((xt.size(0), text_ids.size(1)), dtype=torch.bool)
+
+        for step in range(num_steps):
+            t_val = step * dt
+            t = xt.new_full((xt.size(0),), t_val, dtype=torch.float32)
+
+            # ---- scheduler-consistent hazard scale ----
+            sched = self.path.scheduler(t)  # MixtureDiscreteProbPath scheduler
+            alpha_t = sched.alpha_t
+            dalpha_t = sched.d_alpha_t.clamp_min(1e-6)
+            lam = (dalpha_t / (1.0 - alpha_t).clamp_min(1e-6)).view(-1, 1, 1)  # [B,1,1]
+
+            # ---- logits ----
+            logits_u = self(
+                x_t=xt,
+                text_ids=text_ids,
+                text_att_mask=text_att_mask,
+                time=t,
+                drop_text=True,
+            ).float()
+            logits_c = self(
+                x_t=xt,
+                text_ids=text_ids,
+                text_att_mask=text_att_mask,
+                time=t,
+                drop_text=False,
+            ).float()
+
+            # Optional: ban PAD if it exists and is not EOS-as-PAD
+            if pad_token_id is not None and not bool(getattr(self.config.datasets, "use_eos_as_pad", False)):
+                logits_u[..., pad_token_id] = -torch.inf
+                logits_c[..., pad_token_id] = -torch.inf
+
+            # softmax temperature (you can schedule this if you want)
+            probs_u = torch.softmax(logits_u / max(1e-3, x1_temp), dim=-1)
+            probs_c = torch.softmax(logits_c / max(1e-3, x1_temp), dim=-1)
+
+            # never jump *into* MASK token in uniform-base validation
+            if 0 <= mask_token_id < S:
+                probs_u[..., mask_token_id] = 0.0
+                probs_c[..., mask_token_id] = 0.0
+                probs_u = probs_u / probs_u.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                probs_c = probs_c / probs_c.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            # ---- off-diagonal jump distributions ----
+            # remove self
+            off_u = probs_u.clone()
+            off_c = probs_c.clone()
+            off_u.scatter_(-1, xt[..., None], 0.0)
+            off_c.scatter_(-1, xt[..., None], 0.0)
+
+            off_u = off_u / off_u.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            off_c = off_c / off_c.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            # ---- rates ----
+            R_u = lam * off_u
+            R_c = lam * off_c
+
+            # PFG / CFG in log-rate space:
+            # log R = log Ru + s * (log Rc - log Ru)
+            s = float(guidance_scale)
+            log_Ru = torch.log(R_u + eps)
+            log_Rc = torch.log(R_c + eps)
+            log_R  = log_Ru + s * (log_Rc - log_Ru)
+            R_off  = torch.exp(log_R)
+
+            # ensure diagonal = 0
+            R_off.scatter_(-1, xt[..., None], 0.0)
+            R_off = torch.nan_to_num(R_off, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+            # ---- tau-leap jump step ----
+            hazard = R_off.sum(dim=-1)  # [B,T]
+            p_jump = 1.0 - torch.exp(-dt * hazard)  # [B,T]
+            do_jump = (torch.rand_like(p_jump) < p_jump)
+
+            # never change prefix
+            do_jump[..., :codes_ref_size] = False
+
+            if do_jump.any():
+                hazard_safe = hazard.clamp_min(1e-9)
+                q = R_off / hazard_safe.unsqueeze(-1)  # [B,T,S]
+
+                q2 = q.view(-1, S)
+                jump_idx = do_jump.view(-1).nonzero(as_tuple=False).squeeze(-1)
+
+                q_jump = q2.index_select(0, jump_idx)
+                q_jump = torch.nan_to_num(q_jump, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+                q_jump = q_jump / q_jump.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+                sampled = torch.multinomial(q_jump, 1).squeeze(-1)
+
+                xt_flat = xt.view(-1)
+                xt_flat[jump_idx] = sampled.to(xt_flat.dtype)
+                xt = xt_flat.view_as(xt)
+
+            # re-pin prefix
+            xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        # ---- cleanup: truncate at first EOS (better than removing all EOS) ----
+        xt = xt[..., codes_ref_size:]
+        xt = xt.squeeze(0)
+
+        if eos_token_id is not None and eos_token_id >= 0:
+            pos = (xt == eos_token_id).nonzero(as_tuple=False)
+            if pos.numel() > 0:
+                xt = xt[: int(pos[0].item())]
+
+        if mask_token_id is not None and mask_token_id >= 0:
+            xt = xt[xt != mask_token_id]
+        if pad_token_id is not None:
+            xt = xt[xt != pad_token_id]
+
+        return xt.unsqueeze(0).unsqueeze(0)
+
+    @torch.no_grad()
+    def generate_sample_pfg_euler_uniform(
+        self,
+        xt: torch.Tensor,                 # [B, T]
+        text_ids: torch.Tensor,           # [B, L]
+        codes_ref: torch.Tensor,          # [B, T] or [B, prefix] (you use [:codes_ref_size])
+        nsf: int,
+        codes_ref_size: int,
+        *,
+        x1_temp: float = 1.0,
+        guidance_scale: float = 2.5,      # CFG/PFG scale; 1.0 == conditional only
+        eps: float = 1e-12,
+        clamp_logp: float = 80.0,         # numerical safety before exp/softmax
+    ) -> torch.Tensor:
+        """
+        Official MixtureDiscreteEuler-style CTMC step, but using Predictor-Free Guidance (PFG)
+        to form a guided posterior p_{1|t} before sampling x1.
+
+        Assumptions:
+        - div_free == 0
+        - source distribution is uniform (so we don't need p0 / divergence-free term)
+        - PFG only makes sense if training used cond_drop_prob > 0
+
+        Returns:
+            audio token ids shaped [B, 1, T_gen] (padded across batch)
+        """
+        B, T = xt.shape
+        num_steps = int(nsf)
+        dt = 1.0 / max(1, num_steps)
+
+        S = int(self.config.datasets.audio_vocab_size + self.config.model.audio_add_token)
+
+        # tokens
+        mask_id = int(getattr(self.config.datasets, "audio_mask_token", -1))
+        eos_id  = int(getattr(self.config.datasets, "audio_eos_token", -1))
+        pad_id  = getattr(self.config.datasets, "audio_pad_token", None)
+        pad_id  = int(pad_id) if pad_id is not None else None
+        use_eos_as_pad = bool(getattr(self.config.datasets, "use_eos_as_pad", False))
+        expand_id = getattr(self.config.datasets, "audio_expand_token", None)
+        delete_id = getattr(self.config.datasets, "audio_delete_token", None)
+        expand_id = int(expand_id) if expand_id is not None else None
+        delete_id = int(delete_id) if delete_id is not None else None
+
+        # PFG sanity
+        cond_drop_prob = float(getattr(self.config.datasets, "cond_drop_prob", 0.0))
+        if guidance_scale != 1.0 and cond_drop_prob <= 0.0:
+            raise RuntimeError(
+                "guidance_scale != 1.0 but config.datasets.cond_drop_prob==0.0. "
+                "This checkpoint likely never learned the unconditional (drop_text=True) branch."
+            )
+
+        # pin prefix
+        xt = xt.clone()
+        xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        # audio attention mask if your model uses it
+        audio_att_mask = torch.ones_like(xt, dtype=torch.bool)
+
+        for step in range(num_steps):
+            t_val = step * dt
+            t = xt.new_full((B,), t_val, dtype=torch.float32)
+
+            # ---- model posteriors p_{1|t} ----
+            logits_u = self(
+                x_t=xt,
+                text_ids=text_ids,
+                audio_att_mask=audio_att_mask,
+                time=t,
+                drop_text=True,
+            ).float()
+            logits_c = self(
+                x_t=xt,
+                text_ids=text_ids,
+                audio_att_mask=audio_att_mask,
+                time=t,
+                drop_text=False,
+            ).float()
+
+            temp = max(1e-3, float(x1_temp))
+
+            # Work in log-prob space for stable PFG:
+            logp_u = F.log_softmax(logits_u / temp, dim=-1).clamp(-clamp_logp, clamp_logp)
+            logp_c = F.log_softmax(logits_c / temp, dim=-1).clamp(-clamp_logp, clamp_logp)
+
+            s = float(guidance_scale)
+            # CFG/PFG mixing: log p = log p_u + s * (log p_c - log p_u)
+            logp = logp_u + s * (logp_c - logp_u)
+
+            # p_{1|t}
+            p1t = torch.softmax(logp, dim=-1)  # [B, T, S]
+            p1t = torch.nan_to_num(p1t, nan=0.0, posinf=0.0, neginf=0.0)
+            p1t = p1t / p1t.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+            # sample x1 ~ p_{1|t}(\cdot|x_t)
+            x1 = torch.multinomial(p1t.view(-1, S), 1).view(B, T)
+
+            # final step in official solver: directly set x_t = x1
+            if step == num_steps - 1:
+                xt = x1
+                xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+                break
+
+            # ---- official Euler CTMC rates u = lambda(t) * delta_{x1} (no div_free) ----
+            sched = self.path.scheduler(t)  # MixtureDiscreteProbPath scheduler
+            alpha_t = sched.alpha_t
+            dalpha_t = sched.d_alpha_t.clamp_min(1e-6)
+
+            lam = (dalpha_t / (1.0 - alpha_t).clamp_min(1e-6)).view(B, 1, 1)  # [B,1,1]
+
+            delta_1 = F.one_hot(x1, num_classes=S).to(lam.dtype)               # [B,T,S]
+            u = lam * delta_1                                                  # [B,T,S]
+
+            # Set u(x_t | x_t, x1) = 0 (remove diagonal/current state)
+            delta_t = F.one_hot(xt, num_classes=S).to(torch.bool)              # [B,T,S]
+            u = torch.where(delta_t, torch.zeros_like(u), u)
+
+            # hazard/intensity per position
+            hazard = u.sum(dim=-1)                                             # [B,T]
+
+            # jump probability tau-leap
+            p_jump = 1.0 - torch.exp(-dt * hazard)
+            do_jump = (torch.rand_like(p_jump) < p_jump)
+
+            # never change prefix
+            do_jump[..., :codes_ref_size] = False
+
+            # sample jump destination from u/hazard (only where do_jump)
+            if do_jump.any():
+                hazard_safe = hazard.clamp_min(eps)
+                q = u / hazard_safe.unsqueeze(-1)                              # [B,T,S]
+                q2 = q.view(-1, S)
+                jump_idx = do_jump.view(-1).nonzero(as_tuple=False).squeeze(-1)
+
+                q_jump = q2.index_select(0, jump_idx)
+                q_jump = torch.nan_to_num(q_jump, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+                # (should already be normalized, but be safe)
+                q_jump = q_jump / q_jump.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+                sampled = torch.multinomial(q_jump, 1).squeeze(-1)
+
+                xt_flat = xt.view(-1)
+                xt_flat[jump_idx] = sampled.to(xt_flat.dtype)
+                xt = xt_flat.view_as(xt)
+
+            # re-pin prefix
+            xt[..., :codes_ref_size] = codes_ref[..., :codes_ref_size]
+
+        # ---- postprocess: remove prefix, truncate at first EOS, pad batch ----
+        outs = []
+        for b in range(B):
+            seq = xt[b, codes_ref_size:].detach()
+
+            # truncate at first EOS
+            if eos_id is not None and eos_id >= 0:
+                pos = (seq == eos_id).nonzero(as_tuple=False)
+                if pos.numel() > 0:
+                    seq = seq[: int(pos[0].item())]
+
+            if pad_id is not None:
+                seq = seq[seq != pad_id]
+
+            outs.append(seq)
+
+        max_len = max([int(x.numel()) for x in outs]) if outs else 0
+        if max_len == 0:
+            fill = pad_id if pad_id is not None else (eos_id if eos_id >= 0 else 0)
+            return xt.new_full((B, 1, 1), int(fill), dtype=torch.long)
+
+        fill = pad_id if pad_id is not None else (eos_id if eos_id >= 0 else 0)
+        out = xt.new_full((B, max_len), int(fill), dtype=torch.long)
+        for b, seq in enumerate(outs):
+            L = int(seq.numel())
+            if L > 0:
+                out[b, :L] = seq
+
+        return out.unsqueeze(1)  # [B,1,Tgen]
