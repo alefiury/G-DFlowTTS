@@ -157,6 +157,14 @@ def build_default_en_us_vocab() -> PhonemeTokenizer:
 
 if __name__ == "__main__":
     tokenizer = build_default_en_us_vocab()
+
+    # print vocab size
+    print("Vocab size:", len(tokenizer.id_to_symbol))
+
+    # print ids and vocab
+    for i, s in enumerate(tokenizer.id_to_symbol):
+        print(f"{i}: {s}")
+
     sample_text = "hɛˈloʊ, wɜːrld!"
     encoded = tokenizer.encode_phonemes(sample_text)
     print("Encoded:", encoded)

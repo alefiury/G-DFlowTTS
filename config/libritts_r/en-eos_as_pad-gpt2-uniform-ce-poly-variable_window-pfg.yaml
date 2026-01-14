@@ -38,7 +38,7 @@ datasets:
     use_mask: false
     audio_pad_type: "variable"
 
-    cond_drop_prob: 0.0 # text drop prob
+    cond_drop_prob: 0.1 # text drop prob
 
     assert_drop_prob: true
     guidance_scale: 0.0
