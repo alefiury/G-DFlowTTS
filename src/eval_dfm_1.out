@@ -1,8 +1,0 @@
-
-
-	 Evaluating mnporf1f: mnporf1f multilingual BPE-PFG-en-eos_as_pad-pad_as_loss-cubic model 
-
-
-Index(['text', 'speaker', 'filepath', 'duration', 'reference', 'ref_text',
-       'filepath_codec', 'reference_codec'],
-      dtype='object')

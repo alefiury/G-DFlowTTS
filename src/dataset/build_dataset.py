@@ -10,7 +10,8 @@ from utils.tokenizer import VoiceBpeTokenizer
 from dataset.dataloader import (
     DynamicSingleSpeakerDataset,
     OfflineMultipleSpeakerDataset,
-    HFTextTokenizerDataset
+    HFTextTokenizerDataset,
+    PhonemesDataset
 )
 
 
@@ -80,6 +81,17 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
             filepath_column=config.datasets.filepath_column,
         )
         val_dataset = HFTextTokenizerDataset(
+            data=val_df,
+            base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
+        )
+    elif config.datasets.type == "phoneme_tokenizer":
+        train_dataset = PhonemesDataset(
+            data=train_df,
+            base_dir=config.datasets.base_dir,
+            filepath_column=config.datasets.filepath_column,
+        )
+        val_dataset = PhonemesDataset(
             data=val_df,
             base_dir=config.datasets.base_dir,
             filepath_column=config.datasets.filepath_column,

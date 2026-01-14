@@ -16,6 +16,7 @@ from xcodec2.modeling_xcodec2 import XCodec2Model
 
 from transformers import AutoTokenizer
 from utils.tokenizer import VoiceBpeTokenizer
+from utils.phonemes_tokenizer import PhonemeTokenizer
 from utils.symbols import text_to_sequence
 
 
@@ -1129,6 +1130,155 @@ class HFTextTokenizerCollator:
         x_1_att_mask = audio_att_mask
 
         return x_1, x_1_att_mask, transcription_padded, transcription_att_mask
+
+
+class PhonemesDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        base_dir: str,
+        filepath_column: str,
+        text_column: str = "phonemes",
+    ):
+        """
+        data: A list of data entries, each containing 'audio', 'transcription', 'speaker', etc.
+        tokenizer: A tokenizer used to convert text into tokens.
+        max_audio_duration: Maximum audio duration in seconds (default: 41 seconds).
+        """
+        self.data = data
+        self.base_dir = base_dir
+        self.filepath_column = filepath_column
+        self.text_column = text_column
+
+    def __len__(self):
+        return len(self.data)
+
+    def _load_codes(self, filename):
+        # treat the case that filename starts with "/"
+        if filename.startswith("/") and self.base_dir != "":
+            filename = filename[1:]
+        codes_path = os.path.join(self.base_dir, filename)
+
+        if codes_path.endswith(".wav"):
+            codes_path = codes_path[:-4] + ".pt"
+
+        codes = torch.load(codes_path)
+
+        # remove all empty dimensions
+        codes = codes.squeeze()
+        return codes
+
+    def __getitem__(self, index):
+        datum = self.data.iloc[index]
+        transcription = datum[self.text_column]
+        filename = datum[self.filepath_column]
+        try:
+            audio_codes = self._load_codes(filename)
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            next_idx = random.randint(index+1, len(self.data)-1)
+            return self.__getitem__(next_idx)
+
+        return audio_codes, transcription
+
+
+class PhonemeTokenizerCollator:
+    def __init__(
+        self,
+        phoneme_tokenizer: PhonemeTokenizer,
+        max_audio_length: int,
+        audio_pad_token: int,
+        audio_eos_token: int,
+        audio_pad_type: str,
+        use_eos_as_pad: bool = False,
+    ):
+        self.phoneme_tokenizer = phoneme_tokenizer
+
+        self.max_audio_length = max_audio_length
+        self.audio_pad_token = audio_pad_token
+        self.audio_eos_token = audio_eos_token
+        self.audio_pad_type = audio_pad_type
+        self.use_eos_as_pad = use_eos_as_pad
+
+        if self.use_eos_as_pad:
+            print("\n\tUsing EOS token as padding!!!\n")
+
+    def pad_audio_codec(self, feature: torch.Tensor, max_length: int, padding_value: int = 0) -> torch.Tensor:
+        """
+        Pads the feature tensor along its sequence dimension to max_length.
+        Assumes feature has shape (B, L) or (B, L, D).
+        """
+        current_length = feature.size(1)
+        if current_length < max_length:
+            pad_amount = max_length - current_length
+            padded_feature = F.pad(
+                feature,
+                (0, pad_amount),
+                mode="constant",
+                value=padding_value
+            )
+            return padded_feature
+        elif current_length > max_length:
+            return feature[:, :max_length]
+        else:
+            return feature
+
+    def __call__(self, batch: List[str]):
+        audio_codes, transcriptions = zip(*batch)
+
+        # Decide target batch length (still +1 for EOS)
+        if self.audio_pad_type == "variable":
+            max_audio_length = max([audio.shape[-1] + 1 for audio in audio_codes])  # +1 for EOS
+            max_audio_length = min(max_audio_length, self.max_audio_length)
+        elif self.audio_pad_type == "fixed":
+            max_audio_length = self.max_audio_length
+        else:
+            raise ValueError(f"Unknown audio_pad_type: {self.audio_pad_type}")
+
+        # NEW: effective pad id (EOS or PAD)
+        effective_pad_id = self.audio_eos_token if self.use_eos_as_pad else self.audio_pad_token
+
+        padded_audio_list = []
+        lengths_with_eos = []  # for attention mask
+
+        for audio in audio_codes:
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)  # [1, L]
+
+            # make room for EOS if we must truncate
+            if audio.size(1) >= max_audio_length:
+                audio = audio[:, :max_audio_length - 1]
+
+            # append gold EOS
+            eos_col = torch.full((audio.size(0), 1), self.audio_eos_token, dtype=audio.dtype, device=audio.device)
+            audio = torch.cat([audio, eos_col], dim=1)  # [1, L’]
+            lengths_with_eos.append(audio.size(1))      # scalar len including EOS
+
+            # pad/truncate to batch max with chosen effective pad id
+            padded_audio = self.pad_audio_codec(audio, max_audio_length, effective_pad_id)
+            if padded_audio.size(0) == 1:
+                padded_audio = padded_audio.squeeze(0)  # [L]
+            padded_audio_list.append(padded_audio)
+
+        audio_codes_padded = torch.stack(padded_audio_list, dim=0)  # [B, L]
+
+        # Build audio attention mask: True up to *gold* (content + EOS), False after
+        B, L = audio_codes_padded.shape
+        lengths_with_eos = torch.tensor(lengths_with_eos, device=audio_codes_padded.device, dtype=torch.long)
+        arangeL = torch.arange(L, device=audio_codes_padded.device).unsqueeze(0)  # [1, L]
+        # In this attention mask 1 means valid token (not padding)
+        audio_att_mask = (arangeL < lengths_with_eos.unsqueeze(1))  # [B, L] bool
+
+        transcription_encodings = self.phoneme_tokenizer(list(transcriptions))
+
+        transcription_padded = transcription_encodings.input_ids
+        transcription_att_mask = transcription_encodings.attention_mask.bool()
+
+        x_1 = audio_codes_padded
+        x_1_att_mask = audio_att_mask
+
+        return x_1, x_1_att_mask, transcription_padded, transcription_att_mask
+
 
 
 @torch.no_grad()

@@ -42,7 +42,7 @@ datasets:
     cond_drop_prob: 0.1 # text drop prob
 
     assert_drop_prob: true
-    guidance_scale: 0.0
+    guidance_scale: 0.1
 
     use_eos_as_pad: true
     loss_on_eos_pad: false

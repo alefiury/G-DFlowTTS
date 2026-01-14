@@ -35,6 +35,7 @@ from modules.model_cross_att import TransformerCrossAttn
 from utils.tokenizer import VoiceBpeTokenizer
 from dataset.build_dataset import build_dataset
 from utils.lr_schedulers import CosineWarmupLR, LinearLR
+from utils.phonemes_tokenizer import PhonemeTokenizer
 from modules.flow import KOConvexScheduler, MaskedSourceDistribution, UniformSourceDistribution
 
 from dataset.dataloader import (
@@ -43,6 +44,7 @@ from dataset.dataloader import (
     OfflineMultipleSpeakerDreamOnCollateFunc,
     OfflineVoiceCloningSimplifiedCollateFunc,
     HFTextTokenizerCollator,
+    PhonemeTokenizerCollator,
 )
 
 
@@ -187,6 +189,18 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_pad_type=self.config.datasets.audio_pad_type,
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
             )
+        elif self.config.datasets.type == "phoneme_tokenizer":
+            print("\n\n\tUsing Phoneme Tokenizer Collator for training dataloader!\n\n")
+
+            phoneme_tokenizer = PhonemeTokenizer()
+            collate_fn = PhonemeTokenizerCollator(
+                phoneme_tokenizer=phoneme_tokenizer,
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
         else:
             raise ValueError(f"Invalid dataset type: {self.config.datasets.type}")
 
@@ -256,6 +270,18 @@ class DFMTTSWrapper(L.LightningModule):
 
             collate_fn = HFTextTokenizerCollator(
                 text_tokenizer=text_tokenizer,
+                max_audio_length=self.config.datasets.max_audio_length,
+                audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
+                audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
+                audio_pad_type=self.config.datasets.audio_pad_type,
+                use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
+        elif self.config.datasets.type == "phoneme_tokenizer":
+            print("\n\n\tUsing Phoneme Tokenizer Collator for validation dataloader!\n\n")
+
+            phoneme_tokenizer = PhonemeTokenizer()
+            collate_fn = PhonemeTokenizerCollator(
+                phoneme_tokenizer=phoneme_tokenizer,
                 max_audio_length=self.config.datasets.max_audio_length,
                 audio_pad_token=getattr(self.config.datasets, "audio_pad_token", None),
                 audio_eos_token=getattr(self.config.datasets, "audio_eos_token", None),
@@ -610,8 +636,12 @@ class DFMTTSWrapper(L.LightningModule):
             text_tokenizer = AutoTokenizer.from_pretrained(self.config.datasets.text_tokenizer_name)
             if text_tokenizer.pad_token is None:
                 text_tokenizer.add_special_tokens({"pad_token": text_tokenizer.eos_token})
-        else:
+        elif self.config.datasets.type == "voice_bpe_tokenizer":
             text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
+        elif self.config.datasets.type == "phoneme_tokenizer":
+            text_tokenizer = PhonemeTokenizer()
+        else:
+            raise ValueError(f"Invalid text tokenizer type: {self.config.datasets.type}")
 
         vocab_size = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         max_length = self.config.test.max_audio_length
@@ -623,6 +653,11 @@ class DFMTTSWrapper(L.LightningModule):
 
             if isinstance(text_tokenizer, VoiceBpeTokenizer):
                 text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en-us")).to(self.device).unsqueeze(0)
+            elif isinstance(text_tokenizer, PhonemeTokenizer):
+                print("\n\nUsing Phoneme Tokenizer for text encoding!\n\n")
+                print(f"Phonemes: {augmented_sentence}")
+                text_ids = text_tokenizer(augmented_sentence).input_ids.to(self.device)
+                print(f"Text IDs: {text_ids.shape}", torch.min(text_ids), torch.max(text_ids))
             else:
                 print("\n\nUsing HF AutoTokenizer for text encoding!\n\n")
                 text_ids = text_tokenizer(

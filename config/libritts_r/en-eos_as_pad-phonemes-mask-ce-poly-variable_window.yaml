@@ -1,4 +1,4 @@
-title: DFMTTS-LibriTTS_R-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-LibriTTS_R-Phonemes-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -7,18 +7,18 @@ source_dist_type: "mask"
 scheduler_type: "polynomial" # "ko" or "polynomial"
 
 loss:
-    # function: "cross_entropy"
-    function: "generalized_kl"
+    function: "cross_entropy"
+    # function: "generalized_kl"
 
 datasets:
-    type: "hf_text_tokenizer"
+    type: "phoneme_tokenizer"
 
     text_tokenizer_name: "openai-community/gpt2"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/train_neucodec.csv"
-    val_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/dev_neucodec.csv"
+    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/train_neucodec_phonemes.csv"
+    val_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/dev_neucodec_phonemes.csv"
     base_dir: ""
-    filepath_column: "neucodec_filepath"
+    filepath_column: "neucodec_path"
 
     sampling_rate: 16000
     max_audio_duration: 41
@@ -108,19 +108,19 @@ test:
     nsf: 128
     max_audio_length: 1024
     audio_ref_path: "/raid/aluno_alef/DATASETS/librispeech/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
-    text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
+    text_ref: "hˌi spˈOk wɪð ɐn ɪkstɹˈim ˈɑksfəɹd ˈæksˌɛnt, ænd wˌɛn hi wʌz tˈɔkɪŋ wˈɛl, hɪz fˈAs sˈʌmtˌImz wˈɔɹ ðə ɹˈæpt ɪkspɹˈɛʃən ʌv ɐ vˈɛɹi əmˈOʃᵊnəl mˈæn lˈɪsənɪŋ tə mjˈuzɪk."
     sentences:
-        - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"
-        - "There is no way, however, to eliminate the possibility of the fibers having come from another identical shirt, end quote"
-        - "Oswald's Marine training in marksmanship, his other rifle experience and his established familiarity with this particular weapon"
-        - "Nevertheless, she attempted to commit suicide by driving her nails, purposely left long, into her throat."
-        - "His being was like an all sided lens concentrating all joys in the one heart of his consciousness."
-        - "When he reached Mary's shop, he turned into the court to the kitchen door."
+        - "nˈW, æz ˈɔl bˈʊks nˌɑt pɹImˈɛɹəli ɪntˈɛndᵻd æz pˈɪkʧəɹbˌʊks kənsˈɪst pɹˈɪnsəpᵊli ʌv tˈIps kəmpˈOzd tə fˈɔɹm lˈɛɾəɹpɹˌɛs"
+        - "ðˌɛɹ ɪz nˈO wˈA, hWˈɛvəɹ, tʊ əlˈɪmənˌAt ðə pˌɑsəbˈɪləɾi ʌv ðə fˈIbəɹz hˈævɪŋ kˈʌm fɹʌm ənˈʌðəɹ Idˈɛntəkᵊl ʃˈɜɹt, ˈɛnd kwˈOt"
+        - "ˈɑswᵊldz məɹˈin tɹˈAnɪŋ ɪn mˈɑɹksmənʃˌɪp, hɪz ˈʌðəɹ ɹˈIfᵊl ɪkspˈɪɹiəns ænd hɪz əstˈæblɪʃt fəmˌɪliˈɛɹəɾi wɪð ðɪs pəɹtˈɪkjələɹ wˈɛpən"
+        - "nˌɛvəɹðəlˈɛs, ʃi ətˈɛmptᵻd tə kəmˈɪt sˈuəsˌId bI dɹˈIvɪŋ hɜɹ nˈAlz, pˈɜɹpəsli lˈɛft lˈɔŋ, ˈɪntu hɜɹ θɹˈOt."
+        - "hˌɪz bˈiɪŋ wʌz lˈIk ɐn ˈɔl sˈIdᵻd lˈɛnz kˈɑnsəntɹˌAɾɪŋ ˈɔl ʤˈYz ɪn ðə wˈʌn hˈɑɹt ʌv hɪz kˈɑnʃəsnəs."
+        - "wˌɛn hi ɹˈiʧt mˈɛɹiz ʃˈɑp, hi tˈɜɹnd ˈɪntu ðə kˈɔɹt tə ðə kˈɪʧᵊn dˈɔɹ."
 
 tags:
     - Discrete Flow Matching
     - Neucodec
     - EN
-    - GPT2-Tokenization
+    - Phonemes
     - ${train.batch_size}-BS
     - LR-${optimizer.params.learning_rate}

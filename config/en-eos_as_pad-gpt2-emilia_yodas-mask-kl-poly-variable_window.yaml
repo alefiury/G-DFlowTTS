@@ -1,4 +1,4 @@
-title: DFMTTS-LibriTTS_R-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-EmiliaYodas-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -15,10 +15,10 @@ datasets:
 
     text_tokenizer_name: "openai-community/gpt2"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/train_neucodec.csv"
-    val_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/dev_neucodec.csv"
+    train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
+    val_metadata: ""
     base_dir: ""
-    filepath_column: "neucodec_filepath"
+    filepath_column: "filepath"
 
     sampling_rate: 16000
     max_audio_duration: 41
@@ -29,7 +29,7 @@ datasets:
     text_vocab_size: 50257
     audio_vocab_size: 65536
 
-    text_filler_token: 50256 # same as gpt2 eos token
+    text_filler_token: 50256
 
     audio_eos_token: 65536
     audio_mask_token: 65537
@@ -62,7 +62,7 @@ model:
     text_filler_token: ${datasets.text_filler_token}
 
 train:
-    batch_size: 16
+    batch_size: 32
     shuffle: True
     num_workers: 12
 
@@ -82,14 +82,14 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    max_steps: 500000
+    max_steps: 1000000
     # max_epochs: 3
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
-    val_check_interval: 10000
+    val_check_interval: 50000
     accumulate_grad_batches: 1
     precision: bf16
 
@@ -100,7 +100,7 @@ model_checkpoint:
     save_weights_only: false
     every_n_train_steps: 10000
     monitor: "val/loss_epoch"
-    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS-LibriTTS_R"
+    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS"
     filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
 
 test:
