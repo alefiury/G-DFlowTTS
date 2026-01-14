@@ -474,8 +474,8 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.loss.function == "generalized_kl":
             loss = self.criteria(
                 logits=logits,
-                x_1=x_1,
-                x_t=path_sample.x_t,
+                x_1=x_1.long(),
+                x_t=path_sample.x_t.long(),
                 t=path_sample.t,
             )
             mask = audio_att_mask
@@ -537,8 +537,8 @@ class DFMTTSWrapper(L.LightningModule):
         if self.config.loss.function == "generalized_kl":
             loss = self.criteria(
                 logits=logits,
-                x_1=x_1,
-                x_t=path_sample.x_t,
+                x_1=x_1.long(),
+                x_t=path_sample.x_t.long(),
                 t=path_sample.t,
             )
             mask = audio_att_mask
@@ -552,7 +552,7 @@ class DFMTTSWrapper(L.LightningModule):
                     ignore_index=-100,
                     reduction="mean",
                 )
-            self.log("train/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log("val/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
@@ -613,7 +613,7 @@ class DFMTTSWrapper(L.LightningModule):
         else:
             text_tokenizer = VoiceBpeTokenizer(vocab_file=self.config.datasets.vocab_file)
 
-        vocab_size = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token - 1 # -1 to exclude padding token
+        vocab_size = self.config.datasets.audio_vocab_size + self.config.model.audio_add_token
         max_length = self.config.test.max_audio_length
         generated_audios = {}
         # Iterate over each test sentence from config
@@ -669,6 +669,16 @@ class DFMTTSWrapper(L.LightningModule):
                         codes_ref_size=codes_ref_size
                     )
 
+            codec_vocab = int(self.config.datasets.audio_vocab_size)  # 65536
+            mx = int(x_t.max().item())
+            mn = int(x_t.min().item())
+            print(f"[DEBUG] decode input token range: min={mn} max={mx} codec_vocab={codec_vocab}")
+            if mx >= codec_vocab:
+                bad = (x_t >= codec_vocab).sum().item()
+                print(f"[DEBUG] WARNING: {bad} tokens >= codec_vocab (these will crash decode_code)")
+                print("Removing bad tokens...")
+                # remove the tokens that are >= codec_vocab, and put the elements on the left
+                x_t = x_t[x_t < codec_vocab]
             generated_audio = audio_codec.decode_code(x_t)
             # Use a truncated version of the sentence for the log key (replace spaces with underscores)
             key = f"generated_audio_{idx}"

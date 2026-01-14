@@ -1,4 +1,4 @@
-title: DFMTTS-EmiliaYodas-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-LibriTTS_R-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -7,18 +7,18 @@ source_dist_type: "mask"
 scheduler_type: "polynomial" # "ko" or "polynomial"
 
 loss:
-    function: "cross_entropy"
-    # function: "generalized_kl"
+    # function: "cross_entropy"
+    function: "generalized_kl"
 
 datasets:
     type: "hf_text_tokenizer"
 
     text_tokenizer_name: "openai-community/gpt2"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
-    val_metadata: ""
+    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/train_neucodec.csv"
+    val_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/dev_neucodec.csv"
     base_dir: ""
-    filepath_column: "filepath"
+    filepath_column: "neucodec_filepath"
 
     sampling_rate: 16000
     max_audio_duration: 41
@@ -29,7 +29,7 @@ datasets:
     text_vocab_size: 50257
     audio_vocab_size: 65536
 
-    text_filler_token: 50256
+    text_filler_token: 50256 # same as gpt2 eos token
 
     audio_eos_token: 65536
     audio_mask_token: 65537
@@ -42,7 +42,7 @@ datasets:
     cond_drop_prob: 0.1 # text drop prob
 
     assert_drop_prob: true
-    guidance_scale: 0.0
+    guidance_scale: 0.1
 
     use_eos_as_pad: true
     loss_on_eos_pad: false
@@ -62,7 +62,7 @@ model:
     text_filler_token: ${datasets.text_filler_token}
 
 train:
-    batch_size: 32
+    batch_size: 16
     shuffle: True
     num_workers: 12
 
@@ -82,14 +82,14 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    max_steps: 1000000
+    max_steps: 500000
     # max_epochs: 3
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
-    val_check_interval: 50000
+    val_check_interval: 10000
     accumulate_grad_batches: 1
     precision: bf16
 
@@ -100,14 +100,14 @@ model_checkpoint:
     save_weights_only: false
     every_n_train_steps: 10000
     monitor: "val/loss_epoch"
-    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS"
+    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS-LibriTTS_R"
     filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
 
 test:
     log_audio_ref: true
     nsf: 128
     max_audio_length: 1024
-    audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    audio_ref_path: "/raid/aluno_alef/DATASETS/librispeech/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
     text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
     sentences:
         - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"

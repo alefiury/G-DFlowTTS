@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,13 +15,18 @@ except Exception:
 from modules import rotary
 
 
+# -------------------------
+# helpers
+# -------------------------
 def bias_dropout_add_scale(
     x: Tensor,
     scale: Tensor,
     residual: Optional[Tensor],
     prob: float,
-    training: bool
+    training: bool,
 ) -> Tensor:
+    if residual is None:
+        residual = 0.0
     return residual + scale * F.dropout(x, p=prob, training=training)
 
 
@@ -56,76 +61,97 @@ class TimestepEmbedder(nn.Module):
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=time.device)
             / half
-        ).to(device=time.device)
+        )
         args = time[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
+            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+        return emb
 
     def forward(self, time: Tensor) -> Tensor:
         t_freq = self.timestep_embedding(time=time, dim=self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+        return self.mlp(t_freq)
 
 
+def _make_sdpa_mask_from_valid(valid_mask: Tensor) -> Tensor:
+    """
+    valid_mask: (B, S) bool, True=valid keys (allowed)
+    returns: (B, 1, 1, S) broadcastable for SDPA
+    """
+    if valid_mask.dim() != 2:
+        raise ValueError(f"Expected (B,S) mask, got {tuple(valid_mask.shape)}")
+    return valid_mask[:, None, None, :]
+
+
+# -------------------------
+# Attention modules
+# -------------------------
 class MultiHeadSelfAttention(nn.Module):
     """
-    Self-attention with rotary on (q,k). Uses FlashAttention if available and no attn_mask;
-    otherwise falls back to PyTorch SDPA. Returns projected output.
+    Self-attention on audio tokens.
+    Applies RoPE on (q,k) using your rotary implementation.
+    Respects audio_att_mask (True=valid).
     """
     def __init__(
         self,
         d_model: int,
         num_heads: int,
-        attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        use_flash_if_available: bool = True,
     ):
         super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.attn_drop = attn_drop
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
+        self.use_flash = use_flash_if_available and _flash_attn_available
 
-        self.q_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.k_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.v_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.proj      = nn.Linear(d_model, d_model, bias=False)
+        self.q_linear = nn.Linear(d_model, d_model, bias=False)
+        self.k_linear = nn.Linear(d_model, d_model, bias=False)
+        self.v_linear = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
         self,
-        x: Tensor, # (B, S, D)
-        rotary_cos_sin: Optional[Tensor], # tuple(cos, sin) from rotary for audio stream
-        attn_mask: Optional[Tensor] = None # if needed in future; None by default
+        x: Tensor,  # (B, Sa, D)
+        audio_rotary_cos_sin: Optional[Tuple[Tensor, Tensor]],
+        audio_att_mask: Optional[Tensor] = None,  # (B, Sa) bool True=valid
     ) -> Tensor:
-        B, S, D = x.shape
-        H, Hd   = self.num_heads, self.head_dim
+        B, Sa, D = x.shape
+        H, Hd = self.num_heads, self.head_dim
 
-        # Projections
-        q = self.q_linear(x).view(B, S, H, Hd)
-        k = self.k_linear(x).view(B, S, H, Hd)
-        v = self.v_linear(x).view(B, S, H, Hd)
+        q = self.q_linear(x).view(B, Sa, H, Hd)
+        k = self.k_linear(x).view(B, Sa, H, Hd)
+        v = self.v_linear(x).view(B, Sa, H, Hd)
 
-        # Rotary on q,k
-        if rotary_cos_sin is not None:
+        if audio_rotary_cos_sin is not None:
             with torch.amp.autocast("cuda", enabled=False):
-                cos, sin = rotary_cos_sin
+                cos, sin = audio_rotary_cos_sin
                 orig_dtype = q.dtype
                 q = rotary.apply_rotary_emb_torch(q.float(), cos.float(), sin.float()).to(orig_dtype)
                 k = rotary.apply_rotary_emb_torch(k.float(), cos.float(), sin.float()).to(orig_dtype)
 
-        # SDPA expects (B,H,S,D)
-        q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(
-            q_, k_, v_,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop if self.training else 0.0
-        ) # (B,H,S,Hd)
-        out = rearrange(out, "b h s d -> b s (h d)")
+        # FlashAttention only if no mask (masking breaks this simple path)
+        if self.use_flash and audio_att_mask is None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)  # (B,Sa,H,Hd)
+            out = rearrange(out, "b s h d -> b s (h d)")
+        else:
+            q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+            attn_mask = None
+            if audio_att_mask is not None:
+                attn_mask = _make_sdpa_mask_from_valid(audio_att_mask.to(device=x.device, dtype=torch.bool))
+
+            out = F.scaled_dot_product_attention(
+                q_, k_, v_,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+            )
+            out = rearrange(out, "b h s d -> b s (h d)")
 
         out = self.proj(out)
         out = self.proj_drop(out)
@@ -134,72 +160,90 @@ class MultiHeadSelfAttention(nn.Module):
 
 class MultiHeadCrossAttention(nn.Module):
     """
-    Cross-attention: queries from x (audio), keys/values from cond (text).
-    Uses FlashAttention when available and no padding mask is needed; otherwise SDPA.
-    key_padding_mask: (B, St) bool where True = valid (kept).
+    Cross-attention:
+      Q from audio, K/V from text.
+
+    Text RoPE:
+      Apply RoPE to text K only (encodes text order without a max-length table).
+      Text is NOT padded to audio length. Only tokenizer batch padding exists and is masked.
+
+    Mask convention:
+      text_att_mask: (B, St) bool True=valid
     """
     def __init__(
         self,
         d_model: int,
         num_heads: int,
-        attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        use_flash_if_available: bool = True,
     ):
         super().__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.attn_drop = attn_drop
+        assert self.head_dim % 2 == 0, "RoPE requires even head_dim"
+        self.use_flash = use_flash_if_available and _flash_attn_available
 
-        self.q_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.k_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.v_linear  = nn.Linear(d_model, d_model, bias=False)
-        self.proj      = nn.Linear(d_model, d_model, bias=False)
+        self.q_linear = nn.Linear(d_model, d_model, bias=False)
+        self.k_linear = nn.Linear(d_model, d_model, bias=False)
+        self.v_linear = nn.Linear(d_model, d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(
         self,
-        x: Tensor,                        # (B, Sa, D) queries
-        cond: Tensor,                     # (B, St, D) keys/values
-        key_padding_mask: Optional[Tensor] = None  # (B, St) bool, True=valid
+        x: Tensor,  # (B, Sa, D)
+        text: Tensor,  # (B, St, D)
+        text_att_mask: Optional[Tensor],  # (B, St) bool True=valid
+        text_rotary_cos_sin: Optional[Tuple[Tensor, Tensor]],
     ) -> Tensor:
         B, Sa, D = x.shape
-        St = cond.shape[1]
-        H  = self.num_heads
-        Hd = self.head_dim
+        St = text.shape[1]
+        H, Hd = self.num_heads, self.head_dim
 
-        # Linear projections
-        q_lin = self.q_linear(x)          # (B, Sa, D)
-        k_lin = self.k_linear(cond)       # (B, St, D)
-        v_lin = self.v_linear(cond)       # (B, St, D)
+        q = self.q_linear(x).view(B, Sa, H, Hd)
+        k = self.k_linear(text).view(B, St, H, Hd)
+        v = self.v_linear(text).view(B, St, H, Hd)
 
-        # SDPA with key padding mask
-        q = q_lin.view(B, Sa, H, Hd).transpose(1, 2)  # (B,H,Sa,Hd)
-        k = k_lin.view(B, St, H, Hd).transpose(1, 2)  # (B,H,St,Hd)
-        v = v_lin.view(B, St, H, Hd).transpose(1, 2)  # (B,H,St,Hd)
+        # --- TEXT RoPE on keys only ---
+        if text_rotary_cos_sin is not None:
+            with torch.amp.autocast("cuda", enabled=False):
+                cos, sin = text_rotary_cos_sin
+                orig_dtype = k.dtype
+                k = rotary.apply_rotary_emb_torch(k.float(), cos.float(), sin.float()).to(orig_dtype)
 
-        attn_mask = None
-        if key_padding_mask is not None:
-            attn_mask = key_padding_mask[:, None, None, :] # (B,1,1,St)
+        # FlashAttention only if no mask
+        if self.use_flash and text_att_mask is None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+            out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)  # (B,Sa,H,Hd)
+            out = rearrange(out, "b s h d -> b s (h d)")
+        else:
+            q_, k_, v_ = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop if self.training else 0.0
-        )                               # (B,H,Sa,Hd)
-        out = rearrange(out, "b h s d -> b s (h d)")
+            attn_mask = None
+            if text_att_mask is not None:
+                attn_mask = _make_sdpa_mask_from_valid(text_att_mask.to(device=x.device, dtype=torch.bool))
+
+            out = F.scaled_dot_product_attention(
+                q_, k_, v_,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+            )
+            out = rearrange(out, "b h s d -> b s (h d)")
 
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
 
 
+# -------------------------
+# DiT block
+# -------------------------
 class DDiTBlockCross(nn.Module):
     """
-    Keep the original structure with explicit skip connections:
-      x -> (SelfAttn) -> skip -> (CrossAttn) -> skip -> (MLP) -> skip
-    All modulated by adaLN(time). Reuse gate_msa for both attn residuals (minimal change).
+    DiT-style adaLN-Zero block:
+      SelfAttn(audio) -> CrossAttn(audio<-text) -> MLP
+    Separate modulation per sublayer (9*dim): (shift,scale,gate) x3.
     """
     def __init__(
         self,
@@ -210,90 +254,60 @@ class DDiTBlockCross(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        assert dim % n_heads == 0, "dim must be divisible by n_heads"
-
-        self.n_heads = n_heads
-        self.dim = dim
+        assert dim % n_heads == 0
         self.dropout = dropout
 
-        # Self-attention + norm
-        self.norm1 = LayerNorm(dim=dim)
-        self.self_attn = MultiHeadSelfAttention(
-            d_model=dim,
-            num_heads=n_heads,
-            attn_drop=dropout,
-            proj_drop=dropout
-        )
+        self.norm_sa = LayerNorm(dim)
+        self.self_attn = MultiHeadSelfAttention(dim, n_heads, proj_drop=0.0)
 
-        # Cross-attention + norm
-        self.norm_xattn = LayerNorm(dim=dim)
-        self.cross_attn = MultiHeadCrossAttention(
-            d_model=dim,
-            num_heads=n_heads,
-            attn_drop=dropout,
-            proj_drop=dropout
-        )
+        self.norm_ca = LayerNorm(dim)
+        self.cross_attn = MultiHeadCrossAttention(dim, n_heads, proj_drop=0.0)
 
-        # MLP
-        self.norm2 = LayerNorm(dim=dim)
+        self.norm_mlp = LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_ratio * dim, bias=True),
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_ratio * dim, dim, bias=True),
         )
 
-        # adaLN (time)
-        self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
+        self.adaLN_modulation = nn.Linear(cond_dim, 9 * dim, bias=True)
         self.adaLN_modulation.weight.data.zero_()
         self.adaLN_modulation.bias.data.zero_()
 
     def forward(
         self,
-        x: Tensor,                   # (B, Sa, D)
-        text_emb: Tensor,            # (B, St, D)
-        text_att_mask: Optional[Tensor],  # (B, St) bool: True=valid
-        rotary_cos_sin: Optional[Tensor],
-        c: Tensor
+        x: Tensor,  # (B, Sa, D)
+        c: Tensor,  # (B, cond_dim)
+        audio_rotary_cos_sin: Optional[Tuple[Tensor, Tensor]],
+        audio_att_mask: Optional[Tensor],  # (B, Sa) bool True=valid
+        text_emb: Tensor,  # (B, St, D)
+        text_att_mask: Optional[Tensor],  # (B, St) bool True=valid
+        text_rotary_cos_sin: Optional[Tuple[Tensor, Tensor]],
     ) -> Tensor:
-        (
-            shift_msa,
-            scale_msa,
-            gate_msa,
-            shift_mlp,
-            scale_mlp,
-            gate_mlp,
-        ) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+        (shift_sa, scale_sa, gate_sa,
+         shift_ca, scale_ca, gate_ca,
+         shift_mlp, scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(9, dim=2)
 
-        # ---- Self-attention + skip ----
-        x_sa_in = modulate(self.norm1(x), shift=shift_msa, scale=scale_msa)
-        sa_out = self.self_attn(x_sa_in, rotary_cos_sin=rotary_cos_sin, attn_mask=None)
-        x = bias_dropout_add_scale(
-            x=sa_out,
-            scale=gate_msa,
-            residual=x,
-            prob=self.dropout,
-            training=self.training,
-        )
+        # --- self-attn ---
+        x_in = modulate(self.norm_sa(x), shift=shift_sa, scale=scale_sa)
+        sa_out = self.self_attn(x_in, audio_rotary_cos_sin=audio_rotary_cos_sin, audio_att_mask=audio_att_mask)
+        x = bias_dropout_add_scale(sa_out, gate_sa, x, self.dropout, self.training)
 
-        # ---- Cross-attention + skip ----
-        x_ca_in = modulate(self.norm_xattn(x), shift=shift_msa, scale=scale_msa)
-        ca_out = self.cross_attn(x_ca_in, text_emb, key_padding_mask=text_att_mask)
-        x = bias_dropout_add_scale(
-            x=ca_out,
-            scale=gate_msa,
-            residual=x,
-            prob=self.dropout,
-            training=self.training,
+        # --- cross-attn ---
+        x_in = modulate(self.norm_ca(x), shift=shift_ca, scale=scale_ca)
+        ca_out = self.cross_attn(
+            x_in,
+            text=text_emb,
+            text_att_mask=text_att_mask,
+            text_rotary_cos_sin=text_rotary_cos_sin,
         )
+        x = bias_dropout_add_scale(ca_out, gate_ca, x, self.dropout, self.training)
 
-        # ---- MLP + skip ----
-        x = bias_dropout_add_scale(
-            x=self.mlp(modulate(self.norm2(x), shift=shift_mlp, scale=scale_mlp)),
-            scale=gate_mlp,
-            residual=x,
-            prob=self.dropout,
-            training=self.training,
-        )
+        # --- mlp ---
+        x_in = modulate(self.norm_mlp(x), shift=shift_mlp, scale=scale_mlp)
+        mlp_out = self.mlp(x_in)
+        x = bias_dropout_add_scale(mlp_out, gate_mlp, x, self.dropout, self.training)
+
         return x
 
 
@@ -312,14 +326,23 @@ class DDitFinalLayer(nn.Module):
     def forward(self, x: Tensor, c: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
         x = modulate(self.norm_final(x), shift=shift, scale=scale)
-        x = self.linear(x)
-        return x
+        return self.linear(x)
 
 
+# -------------------------
+# Full model
+# -------------------------
 class TransformerCrossAttn(nn.Module):
     """
-    Text is injected via cross-attention (as memory), time via adaLN.
-    Self-attn path keeps FlashAttention when available.
+    Cross-attention DiT (time-only adaLN conditioning, text through cross-attn only).
+
+    Text RoPE:
+      - computed from text_emb length St
+      - applied to text keys in cross-attention
+
+    Masks:
+      audio_att_mask: (B, Sa) bool True=valid
+      text_att_mask : (B, St) bool True=valid
     """
     def __init__(
         self,
@@ -328,77 +351,111 @@ class TransformerCrossAttn(nn.Module):
         hidden_size: int,
         cond_dim: int,
         n_heads: int,
-        dropout: int,
+        dropout: float,
         n_blocks: int,
-        add_token: int = 2,
-        audio_pad_token: Optional[int] = 0
+        audio_add_token: int,          # mask + pad, etc.
+        text_add_token: int,           # if you add extra symbols
+        audio_pad_token: Optional[int] = None,
+        text_pad_token: Optional[int] = None,
+        text_filler_token: Optional[int] = None,  # used when drop_text=True
+        mlp_ratio: int = 4,
+        **kwargs,
     ):
         super().__init__()
-        self.audio_vocab_size = audio_vocab_size
-        self.audio_pad_token = audio_pad_token
-        self.text_vocab_size = text_vocab_size
 
-        self.audio_embed = nn.Embedding(self.audio_vocab_size + add_token, hidden_size)
-        self.text_embed  = nn.Embedding(self.text_vocab_size + 1, hidden_size)  # +1 for filler=0
+        self.audio_vocab_size = int(audio_vocab_size)
+        self.text_vocab_size = int(text_vocab_size)
+        self.audio_add_token = int(audio_add_token)
+        self.text_add_token = int(text_add_token)
+
+        self.audio_pad_token = audio_pad_token
+        self.text_pad_token = text_pad_token
+        self.text_filler_token = int(text_filler_token) if text_filler_token is not None else 0
+
+        true_audio_vocab = self.audio_vocab_size + self.audio_add_token
+        true_text_vocab = self.text_vocab_size + self.text_add_token
+
+        self.audio_embed = nn.Embedding(true_audio_vocab, hidden_size)
+        self.text_embed = nn.Embedding(true_text_vocab, hidden_size)
 
         self.time_embedding = TimestepEmbedder(hidden_size=cond_dim)
-        self.rotary_emb = rotary.Rotary(dim=hidden_size // n_heads)
+
+        # RoPE: audio (self-attn) and text (cross-attn keys)
+        self.audio_rotary = rotary.Rotary(dim=hidden_size // n_heads)
+        self.text_rotary = rotary.Rotary(dim=hidden_size // n_heads)
 
         self.input_proj = nn.Linear(hidden_size, hidden_size)
 
-        self.blocks = nn.ModuleList(
-            [
-                DDiTBlockCross(
-                    dim=hidden_size,
-                    n_heads=n_heads,
-                    cond_dim=cond_dim,
-                    dropout=dropout,
-                )
-                for _ in range(n_blocks)
-            ]
-        )
+        self.blocks = nn.ModuleList([
+            DDiTBlockCross(
+                dim=hidden_size,
+                n_heads=n_heads,
+                cond_dim=cond_dim,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+            )
+            for _ in range(n_blocks)
+        ])
 
         self.output_layer = DDitFinalLayer(
             hidden_size=hidden_size,
-            out_channels=audio_vocab_size + add_token,
+            out_channels=true_audio_vocab,
             cond_dim=cond_dim,
         )
 
     def forward(
         self,
-        x_t: Tensor,               # (B, Sa)
-        text: Tensor,              # (B, St) int ids
-        text_att_mask: Tensor,     # (B, St) bool: True for valid tokens
-        time: Tensor,              # (B,)
+        x_t: Tensor,                          # (B, Sa)
+        text: Tensor,                         # (B, St)
+        time: Tensor,                         # (B,)
         drop_text: bool = False,
+        text_att_mask: Optional[Tensor] = None,   # (B, St) bool True=valid
+        audio_att_mask: Optional[Tensor] = None,  # (B, Sa) bool True=valid
     ) -> Tensor:
-        # Audio embeddings
-        x = self.audio_embed(x_t)          # (B, Sa, D)
-        x = self.input_proj(x)             # (B, Sa, D)
+        # --- audio ---
+        x = self.audio_embed(x_t)         # (B, Sa, D)
+        x = self.input_proj(x)
 
-        # Text embeddings (+1 shift so 0 is filler)
-        text_ids = text + 1
+        B, Sa, _ = x.shape
+        if audio_att_mask is None:
+            audio_att_mask = torch.ones((B, Sa), device=x.device, dtype=torch.bool)
+        else:
+            audio_att_mask = audio_att_mask.to(device=x.device, dtype=torch.bool)
+
+        # --- text (no padding to Sa) ---
+        text = text.to(device=x.device)
+        if text_att_mask is None:
+            if self.text_pad_token is not None:
+                text_att_mask = (text != self.text_pad_token)
+            else:
+                text_att_mask = torch.ones_like(text, dtype=torch.bool)
+        text_att_mask = text_att_mask.to(device=x.device, dtype=torch.bool)
+
         if drop_text:
-            text_ids = torch.zeros_like(text_ids) # Filler tokens to represent "dropped text" for PFG
-            text_att_mask = torch.ones_like(text_att_mask, dtype=torch.bool) # This will be inverted to False in the cross attention module
-        text_emb = self.text_embed(text_ids)  # (B, St, D)
+            # unconditional: replace ids with filler token, mark all as valid
+            text = torch.full_like(text, fill_value=self.text_filler_token)
+            text_att_mask = torch.ones_like(text_att_mask, dtype=torch.bool)
 
-        # Time conditioning
-        c = F.silu(self.time_embedding(time=time))  # (B, cond_dim)
+        text_emb = self.text_embed(text)  # (B, St, D)
 
-        # Rotary (audio stream) for self-attn
-        rotary_cos_sin = self.rotary_emb(x=x)
+        # --- time conditioning (time-only, per your preference) ---
+        c = F.silu(self.time_embedding(time=time.to(device=x.device)))  # (B, cond_dim)
 
-        # Blocks
+        # --- RoPE caches based on seq_len ---
+        audio_rotary_cos_sin = self.audio_rotary(x=x)        # uses Sa
+        text_rotary_cos_sin = self.text_rotary(x=text_emb)   # uses St
+
+        # --- blocks ---
         for blk in self.blocks:
             x = blk(
                 x=x,
+                c=c,
+                audio_rotary_cos_sin=audio_rotary_cos_sin,
+                audio_att_mask=audio_att_mask,
                 text_emb=text_emb,
                 text_att_mask=text_att_mask,
-                rotary_cos_sin=rotary_cos_sin,
-                c=c
+                text_rotary_cos_sin=text_rotary_cos_sin,
             )
 
-        # Logits
-        x = self.output_layer(x=x, c=c)
-        return x
+        # --- logits ---
+        return self.output_layer(x=x, c=c)

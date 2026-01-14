@@ -3,7 +3,7 @@ wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
 model_type: "dit_adaln"
-source_dist_type: "mask"
+source_dist_type: "uniform"
 scheduler_type: "polynomial" # "ko" or "polynomial"
 
 loss:
@@ -11,9 +11,8 @@ loss:
     # function: "generalized_kl"
 
 datasets:
-    type: "hf_text_tokenizer"
-
-    text_tokenizer_name: "openai-community/gpt2"
+    type: "offline_voice_cloning_simplified"
+    vocab_file: "/raid/aluno_alef/DFM-TTS-2/config/vocab.json"
 
     train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
     val_metadata: ""
@@ -23,24 +22,22 @@ datasets:
     sampling_rate: 16000
     max_audio_duration: 41
 
-    vocab_file: "/raid/aluno_alef/DFM-TTS-2/config/vocab.json"
     codec_name: "neucodec"
     max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
 
-    text_vocab_size: 50257
+    text_vocab_size: 6681
     audio_vocab_size: 65536
 
-    text_filler_token: 50257
+    text_pad_token: 0
+    text_filler_token: 0
 
     audio_eos_token: 65536
-    audio_mask_token: 65537
 
     mask_prob: [0.0, 1.0]
 
-    use_mask: true
-    audio_pad_type: "fixed"
+    audio_pad_type: "variable"
 
-    cond_drop_prob: 0.0 # text drop prob
+    cond_drop_prob: 0.1 # text drop prob
 
     assert_drop_prob: true
     guidance_scale: 0.0
@@ -56,8 +53,8 @@ model:
     n_heads: 12
     dropout: 0.1
     n_blocks: 12
-    audio_add_token: 2 # eos + mask token
-    text_add_token: 1 # filler token
+    audio_add_token: 1 # eos + mask token
+    text_add_token: 0 # filler and pad token
     audio_pad_token:
     text_pad_token:
     text_filler_token: ${datasets.text_filler_token}
@@ -107,7 +104,7 @@ model_checkpoint:
 test:
     log_audio_ref: true
     nsf: 256
-    max_audio_length: 2048
+    max_audio_length: 1024
     audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
     text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
     sentences:
@@ -122,6 +119,6 @@ tags:
     - Discrete Flow Matching
     - Neucodec
     - EN
-    - GPT2-Tokenization
+    - BPE-Tokenization
     - ${train.batch_size}-BS
     - LR-${optimizer.params.learning_rate}
