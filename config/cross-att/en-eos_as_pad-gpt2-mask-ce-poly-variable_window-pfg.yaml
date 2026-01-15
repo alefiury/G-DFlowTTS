@@ -1,0 +1,126 @@
+title: DFMTTS-CrossAtt-LibriTTS_R-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+wandb_project_name: "DFM-TTS"
+wandb_entity: "alefiury"
+
+model_type: "dit_crossattn"
+source_dist_type: "mask"
+scheduler_type: "polynomial" # "ko" or "polynomial"
+
+loss:
+    function: "cross_entropy"
+    # function: "generalized_kl"
+
+datasets:
+    type: "hf_text_tokenizer"
+
+    text_tokenizer_name: "openai-community/gpt2"
+
+    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/train_neucodec.csv"
+    val_metadata: "/raid/aluno_alef/DATASETS/neucodec/LibriTTS_R/dev_neucodec.csv"
+    base_dir: ""
+    filepath_column: "neucodec_filepath"
+
+    sampling_rate: 16000
+    max_audio_duration: 41
+
+    codec_name: "neucodec"
+    max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
+
+    text_vocab_size: 50257
+    audio_vocab_size: 65536
+
+    text_filler_token: 50256 # same as gpt2 eos token
+
+    audio_eos_token: 65536
+    audio_mask_token: 65537
+
+    mask_prob: [0.0, 1.0]
+
+    use_mask: true
+    audio_pad_type: "variable"
+
+    cond_drop_prob: 0.1 # text drop prob
+
+    assert_drop_prob: true
+    guidance_scale: 0.0
+
+    use_eos_as_pad: true
+    loss_on_eos_pad: false
+
+model:
+    audio_vocab_size: ${datasets.audio_vocab_size}
+    text_vocab_size: ${datasets.text_vocab_size}
+    hidden_size: 768
+    cond_dim: 128
+    n_heads: 12
+    dropout: 0.1
+    n_blocks: 12
+    audio_add_token: 2 # eos + mask token
+    text_add_token: 0 # filler token
+    audio_pad_token:
+    text_pad_token:
+    text_filler_token: ${datasets.text_filler_token}
+
+train:
+    batch_size: 16
+    shuffle: True
+    num_workers: 12
+
+optimizer:
+    name: "adamw"
+    params:
+        min_learning_rate: 1e-4
+        learning_rate: 3e-4
+        eps: 1e-8
+        weight_decay: 1e-6
+        betas: [0.9, 0.999]
+
+scheduler:
+    name: "CosineWarmupLR"
+    params:
+        warmup_lr: 5000
+
+trainer:
+    accelerator: "gpu"
+    max_steps: 500000
+    # max_epochs: 3
+    num_sanity_val_steps: 2
+    overfit_batches: 0.0
+    log_every_n_steps: 10
+    gradient_clip_val: 10.0
+    gradient_clip_algorithm: "norm"
+    val_check_interval: 10000
+    accumulate_grad_batches: 1
+    precision: bf16
+
+model_checkpoint:
+    mode: "min"
+    save_top_k: 2
+    save_last: true
+    save_weights_only: false
+    every_n_train_steps: 10000
+    monitor: "val/loss_epoch"
+    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS-LibriTTS_R"
+    filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
+
+test:
+    log_audio_ref: true
+    nsf: 128
+    max_audio_length: 1024
+    audio_ref_path: "/raid/aluno_alef/DATASETS/librispeech/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
+    sentences:
+        - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"
+        - "There is no way, however, to eliminate the possibility of the fibers having come from another identical shirt, end quote"
+        - "Oswald's Marine training in marksmanship, his other rifle experience and his established familiarity with this particular weapon"
+        - "Nevertheless, she attempted to commit suicide by driving her nails, purposely left long, into her throat."
+        - "His being was like an all sided lens concentrating all joys in the one heart of his consciousness."
+        - "When he reached Mary's shop, he turned into the court to the kitchen door."
+
+tags:
+    - Discrete Flow Matching
+    - Neucodec
+    - EN
+    - GPT2-Tokenization
+    - ${train.batch_size}-BS
+    - LR-${optimizer.params.learning_rate}

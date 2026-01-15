@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 import torchaudio
+from torchaudio import transforms as T
 from omegaconf import OmegaConf
 
 from transformers import AutoTokenizer
@@ -256,7 +257,7 @@ def sample_mask_ctmc(
                 "This checkpoint likely never learned the unconditional branch."
             )
 
-    for k in tqdm(range(int(steps)), desc="CTMC sampling", total=int(steps)):
+    for k in range(int(steps)):
         t_lin = k * dt
         t = torch.full((1,), float(t_lin), device=device, dtype=torch.float32)
 
@@ -397,11 +398,11 @@ def sample_mask_ctmc(
         # print("10"*100)
 
         # Always re-pin prefix
-        xt[:, :prefix_len] = codes_ref_1d.unsqueeze(0)
+        # xt[:, :prefix_len] = codes_ref_1d.unsqueeze(0)
 
         # count number of masked positions in suffix
         num_masked = (xt[:, prefix_len:] == mask_id).sum().item()
-        print(f"Step {k+1}/{steps}, masked positions in suffix: {num_masked}")
+        # print(f"Step {k+1}/{steps}, masked positions in suffix: {num_masked}")
 
         # print("11"*100)
 
@@ -414,9 +415,47 @@ def sample_mask_ctmc(
     return xt
 
 
-# ----------------------------
-# Main CLI
-# ----------------------------
+def load_audio(filepath: str, target_sr: int = 16_000) -> Tuple[torch.Tensor, int]:
+    """
+    Load audio file and resample to target sample rate if necessary.
+
+    Args:
+        filepath (str): Path to the audio file.
+        target_sr (int): Target sample rate. Default is 16,000 Hz.
+
+    Returns:
+        Tuple[torch.Tensor, int]: Loaded audio tensor and the sample rate.
+    """
+    y, sr = torchaudio.load(filepath)  # (1, T)
+    if sr != target_sr:
+        y = T.Resample(sr, target_sr)(y)
+
+    if y.dim() == 1:
+        y = y.unsqueeze(0).unsqueeze(0)
+    # put in # (1, 1, T_16) if not
+    if y.dim() == 2:
+        y = y.unsqueeze(0)
+
+    return y, target_sr  # (1, 1, T_16)
+
+
+@torch.inference_mode()
+def extract_codes(model: NeuCodec, filepath: str) -> torch.Tensor:
+    """
+    Extract feature codes from audio file.
+
+    Args:
+        model (NeuCodec): Pretrained NeuCodec model.
+        filepath (str): Path to the audio file.
+    Returns:
+        torch.Tensor: Extracted feature codes.
+    """
+    y, sr = load_audio(filepath)  # (1, 1, T_16)
+    with torch.no_grad():
+        fsq_codes = model.encode_code(y)  # (1, T_code)
+
+    return fsq_codes.squeeze(0).cpu()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -441,7 +480,7 @@ def main():
 
     # PFG (only for checkpoints trained with cond_drop_prob > 0)
     parser.add_argument("--use_pfg", action="store_true")
-    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=2.5)
 
     parser.add_argument("--max_rows", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=0)
@@ -460,6 +499,7 @@ def main():
         config=config,
         map_location=device,
         strict=False,
+        weights_only=False,
     ).to(device)
     model.eval()
 
@@ -501,91 +541,108 @@ def main():
     mask_id = int(getattr(config.datasets, "audio_mask_token", -1))
 
     for idx, row in df.iterrows():
-        try:
-            text = str(row["text"])
-            text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
+        # try:
+        text = str(row["text"])
+        text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
 
-            filepath_codec = str(row["filepath_codec"])
-            ref_filepath_codec = str(row["reference_codec"])
+        filepath_codec = str(row["filepath_codec"])
+        ref_filepath_codec = str(row["reference_codec"])
 
-            # Load reference codes (prefix)
-            codes_ref = torch.load(ref_filepath_codec).squeeze()
-            if codes_ref.ndim != 1:
-                codes_ref = codes_ref.reshape(-1)
-            codes_ref = codes_ref.long().to(device)
+        target_filepath = str(row["filepath"])
+        reference_filepath = str(row["reference"])
 
-            # Build text inputs using the SAME tokenizer as training
-            text_ids, text_att_mask, _tok = build_text_inputs(config, text, text_ref, device)
+        # Load reference codes (prefix)
+        # codes_ref = torch.load(ref_filepath_codec).squeeze()
+        codes_ref = extract_codes(codec, reference_filepath).squeeze()
+        if codes_ref.ndim != 1:
+            codes_ref = codes_ref.reshape(-1)
+        codes_ref = codes_ref.long().to(device)
 
-            # Oracle length (suffix length)
-            oracle_len = None
-            if args.use_oracle_length:
-                oracle_codes = torch.load(filepath_codec).squeeze()
-                if oracle_codes.ndim != 1:
-                    oracle_codes = oracle_codes.reshape(-1)
-                oracle_len = int(oracle_codes.numel())
-                if args.oracle_add_eos:
-                    oracle_len += 1
+        # Build text inputs using the SAME tokenizer as training
+        text_ids, text_att_mask, _tok = build_text_inputs(config, text, text_ref, device)
 
-            # Predict suffix length if needed
-            if oracle_len is None:
-                # suffix_len = get_remaining_duration(
-                #     duration_model=duration_model,
-                #     text_ids=text_ids,
-                #     codes_ref_1d=codes_ref,
-                #     config=config,
-                #     device=device,
-                # )
-                suffix_len = 2048
-                print(f"[row {idx}] using fixed suffix length: {suffix_len}")
-            else:
-                suffix_len = oracle_len
+        # Oracle length (suffix length)
+        oracle_len = None
+        if args.use_oracle_length:
+            # oracle_codes = torch.load(filepath_codec).squeeze()
+            oracle_codes = extract_codes(codec, target_filepath).squeeze()
+            if oracle_codes.ndim != 1:
+                oracle_codes = oracle_codes.reshape(-1)
+            oracle_len = int(oracle_codes.numel())
+            if args.oracle_add_eos:
+                oracle_len += 1
 
-            for steps in steps_list:
-                out_wav = os.path.join(args.output_dir, f"audio_{idx}-nsf{steps}.wav")
-                if os.path.exists(out_wav):
-                    continue
+        print(f"\n\n oracle_len: {oracle_len}-{oracle_len/50} \n\n")
 
-                with torch.no_grad():
-                    xt_full = sample_mask_ctmc(
-                        config=config,
-                        model=model,
-                        path=path,
-                        text_ids=text_ids,
-                        text_att_mask=text_att_mask,
-                        codes_ref_1d=codes_ref,
-                        suffix_len=suffix_len,
-                        steps=steps,
-                        device=device,
-                        x1_temp=float(args.x1_temp),
-                        temp_schedule=str(args.temp_schedule),
-                        remask_noise=float(args.remask_noise),
-                        use_pfg=bool(args.use_pfg),
-                        gamma=float(args.gamma),
-                    )
+        # Predict suffix length if needed
+        if oracle_len is None:
+            # suffix_len = get_remaining_duration(
+            #     duration_model=duration_model,
+            #     text_ids=text_ids,
+            #     codes_ref_1d=codes_ref,
+            #     config=config,
+            #     device=device,
+            # )
+            suffix_len = 2048
+            print(f"[row {idx}] using fixed suffix length: {suffix_len}")
+        else:
+            suffix_len = oracle_len
 
-                    # Extract generated suffix
-                    prefix_len = int(codes_ref.numel())
-                    gen = xt_full[0, prefix_len:].detach().cpu()
+        # print(f"\n\n suffix_len:{suffix_len}-{suffix_len/50} \n\n")
 
-                    # Truncate at first EOS, then drop any remaining MASK (if any)
-                    gen = truncate_at_first_eos(gen, eos_id)
-                    gen = gen[gen != mask_id]
+        for steps in steps_list:
+            # print(f"\n\n suffix_len:{suffix_len}  | {steps}\n\n")
+            out_wav = os.path.join(args.output_dir, f"audio_{idx}-nsf{steps}.wav")
+            if os.path.exists(out_wav):
+                continue
 
-                    # Prepare shape for codec decode (matches your training wrapper usage)
-                    gen_for_codec = gen.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,T]
+            with torch.no_grad():
+                xt_full = sample_mask_ctmc(
+                    config=config,
+                    model=model,
+                    path=path,
+                    text_ids=text_ids,
+                    text_att_mask=text_att_mask,
+                    codes_ref_1d=codes_ref,
+                    suffix_len=suffix_len,
+                    steps=steps,
+                    device=device,
+                    x1_temp=float(args.x1_temp),
+                    temp_schedule=str(args.temp_schedule),
+                    remask_noise=float(args.remask_noise),
+                    use_pfg=bool(args.use_pfg),
+                    gamma=float(args.gamma),
+                )
 
-                    gen_for_codec = gen_for_codec.detach()
+                # Extract generated suffix
+                prefix_len = int(codes_ref.numel())
+                # save ref inside gen
+                ref_gen = xt_full[0, :prefix_len]
 
-                    # Decode to waveform
-                    wav = codec.decode_code(gen_for_codec).detach()
+                gen = xt_full[0, prefix_len:].detach().cpu()
 
-                # Save
-                torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)
+                # Truncate at first EOS, then drop any remaining MASK (if any)
+                gen = truncate_at_first_eos(gen, eos_id)
+                gen = gen[gen != mask_id]
 
-        except Exception as e:
-            print(f"[row {idx}] error: {e}")
-            continue
+                # Prepare shape for codec decode (matches your training wrapper usage)
+                gen_for_codec = gen.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,T]
+
+                gen_for_codec = gen_for_codec.detach()
+
+                # Decode to waveform
+                wav = codec.decode_code(gen_for_codec).detach()
+
+                wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
+                out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
+                torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
+
+            # Save
+            torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)
+
+        # except Exception as e:
+        #     print(f"[row {idx}] error: {e}")
+        #     continue
 
 
 if __name__ == "__main__":
