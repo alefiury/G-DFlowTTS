@@ -36,6 +36,7 @@ from utils.tokenizer import VoiceBpeTokenizer
 from dataset.build_dataset import build_dataset
 from utils.lr_schedulers import CosineWarmupLR, LinearLR
 from utils.phonemes_tokenizer import PhonemeTokenizer
+from utils.inference_utils import sample_with_official_solver
 from modules.flow import KOConvexScheduler, MaskedSourceDistribution, UniformSourceDistribution
 
 from dataset.dataloader import (
@@ -74,7 +75,8 @@ class DFMTTSWrapper(L.LightningModule):
         elif self.config.source_dist_type == "mask":
             print("\n\nUsing Masked Source Distribution!\n\n")
             self.source_distribution = MaskedSourceDistribution(
-                mask_token=self.config.datasets.audio_mask_token
+                mask_token=self.config.datasets.audio_mask_token,
+                vocab_size=self.config.datasets.audio_vocab_size + self.config.model.audio_add_token,
             )
         else:
             raise ValueError(f"Invalid source distribution: {self.config.source_dist_type}")
@@ -438,6 +440,42 @@ class DFMTTSWrapper(L.LightningModule):
             speech_tokens = speech_tokens.squeeze(1)
         return speech_tokens.long()
 
+    def build_keep_prefix(
+        self,
+        x1: torch.Tensor,                 # [B, L]
+        audio_att_mask: torch.Tensor,      # [B, L] bool
+        fps: int = 50,
+        min_sec: float = 0.0,
+        max_sec: float = 15.0,
+        ensure_min_gen_sec: float = 0.5,  # keep at least this much to generate
+    ) -> torch.Tensor:
+        B, L = x1.shape
+        device = x1.device
+
+        valid_len = audio_att_mask.long().sum(dim=1)  # [B]
+        minP = torch.round(torch.tensor(min_sec * fps, device=device)).long()
+        maxP = torch.round(torch.tensor(max_sec * fps, device=device)).long()
+        minGen = torch.round(torch.tensor(ensure_min_gen_sec * fps, device=device)).long()
+
+        # For each sample, cap maxP so we still have something to generate
+        maxP_i = torch.clamp(valid_len - minGen, min=minP, max=maxP)
+
+        # Sample P per sample in [minP, maxP_i]
+        # (torch.randint high is exclusive)
+        P = torch.empty((B,), device=device, dtype=torch.long)
+        for b in range(B):
+            hi = int(maxP_i[b].item())
+            lo = int(minP.item())
+            if hi <= lo:
+                P[b] = lo
+            else:
+                P[b] = torch.randint(lo, hi + 1, (1,), device=device)
+
+        idx = torch.arange(L, device=device).unsqueeze(0)  # [1,L]
+        keep = idx < P.unsqueeze(1)                        # [B,L]
+        keep = keep & audio_att_mask.bool()                # never keep padding
+        return keep
+
     def forward(
         self,
         x_t: Tensor,
@@ -473,6 +511,18 @@ class DFMTTSWrapper(L.LightningModule):
                 raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
+            keep_prefix = None
+            if self.config.datasets.get("use_prefix_mask", False):
+                keep_prefix = self.build_keep_prefix(
+                    x1=x_1,
+                    audio_att_mask=audio_att_mask,
+                    fps=self.config.datasets.get("fps", 50),
+                    min_sec=self.config.datasets.get("prefix_min_sec", 0.0),
+                    max_sec=self.config.datasets.get("prefix_max_sec", 15.0),
+                    ensure_min_gen_sec=self.config.datasets.get("prefix_ensure_min_gen_sec", 0.5),
+                )
+                x_0 = torch.where(keep_prefix, x_1, x_0)
+
             # Elbo may have singularity at 1
             time_epsilon = 1e-3 if isinstance(self.criteria, MixturePathGeneralizedKL) else 0.0
             t = torch.rand(x_1.shape[0], device=x_1.device) * (1.0 - time_epsilon)
@@ -497,6 +547,9 @@ class DFMTTSWrapper(L.LightningModule):
             text_att_mask=transcription_att_mask,
         ).float()
 
+        if self.config.datasets.get("use_prefix_mask", False):
+            audio_att_mask = audio_att_mask & (~keep_prefix)
+
         if self.config.loss.function == "generalized_kl":
             loss = self.criteria(
                 logits=logits,
@@ -510,20 +563,37 @@ class DFMTTSWrapper(L.LightningModule):
             with torch.no_grad():
                 # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
                 ce_target = x_1.masked_fill(~audio_att_mask.bool(), -100)
-                aux_ce_loss = torch.nn.functional.cross_entropy(
+                # aux_ce_loss = torch.nn.functional.cross_entropy(
+                #     logits.view(-1, logits.size(-1)),
+                #     ce_target.view(-1).long(),
+                #     ignore_index=-100,
+                #     reduction="mean",
+                # )
+                loss_per = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     ce_target.view(-1).long(),
                     ignore_index=-100,
-                    reduction="mean",
-                )
+                    reduction="none",
+                ).view_as(x_1)
+                mask = audio_att_mask.bool()
+                aux_ce_loss = (loss_per * mask).sum() / mask.sum().clamp_min(1)
             self.log("train/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
-            loss = self.criteria(
+
+            # loss = self.criteria(
+            #     input=logits.view(-1, logits.size(-1)),
+            #     target=target.view(-1).long()
+            # ).mean()
+
+            loss_per = self.criteria(
                 input=logits.view(-1, logits.size(-1)),
                 target=target.view(-1).long()
-            ).mean()
+            ).view_as(x_1)  # [B, L]
+
+            mask = audio_att_mask.bool()
+            loss = (loss_per * mask).sum() / mask.sum().clamp_min(1)
 
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -546,6 +616,17 @@ class DFMTTSWrapper(L.LightningModule):
                 raise ValueError(f"Invalid number of elements in batch: {len(batch)}")
 
         with torch.no_grad():
+            if self.config.datasets.get("use_prefix_mask", False):
+                keep_prefix = self.build_keep_prefix(
+                    x1=x_1,
+                    audio_att_mask=audio_att_mask,
+                    fps=self.config.datasets.get("fps", 50),
+                    min_sec=self.config.datasets.get("prefix_min_sec", 0.0),
+                    max_sec=self.config.datasets.get("prefix_max_sec", 15.0),
+                    ensure_min_gen_sec=self.config.datasets.get("prefix_ensure_min_gen_sec", 0.5),
+                )
+                x_0 = torch.where(keep_prefix, x_1, x_0)
+
             time_epsilon = 1e-3 if isinstance(self.criteria, MixturePathGeneralizedKL) else 0.0
             t = torch.rand(x_1.shape[0], device=x_1.device) * (1.0 - time_epsilon)
             path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
@@ -560,6 +641,9 @@ class DFMTTSWrapper(L.LightningModule):
             text_att_mask=transcription_att_mask,
         ).float()
 
+        if self.config.datasets.get("use_prefix_mask", False):
+            audio_att_mask = audio_att_mask & (~keep_prefix)
+
         if self.config.loss.function == "generalized_kl":
             loss = self.criteria(
                 logits=logits,
@@ -572,20 +656,37 @@ class DFMTTSWrapper(L.LightningModule):
 
             with torch.no_grad():
                 ce_target = x_1.masked_fill(~audio_att_mask.bool(), -100)
-                aux_ce_loss = torch.nn.functional.cross_entropy(
+                # aux_ce_loss = torch.nn.functional.cross_entropy(
+                #     logits.view(-1, logits.size(-1)),
+                #     ce_target.view(-1).long(),
+                #     ignore_index=-100,
+                #     reduction="mean",
+                # )
+
+                loss_per = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     ce_target.view(-1).long(),
                     ignore_index=-100,
-                    reduction="mean",
-                )
+                    reduction="none",
+                ).view_as(x_1)
+                mask = audio_att_mask.bool()
+                aux_ce_loss = (loss_per * mask).sum() / mask.sum().clamp_min(1)
             self.log("val/aux_ce_loss", aux_ce_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         else:
             # use audio mask to transform padding positions to -100 so that they are ignored in the CE loss
             target = x_1.masked_fill(~audio_att_mask.bool(), -100)
-            loss = self.criteria(
+            # loss = self.criteria(
+            #     input=logits.view(-1, logits.size(-1)),
+            #     target=target.view(-1).long()
+            # ).mean()
+
+            loss_per = self.criteria(
                 input=logits.view(-1, logits.size(-1)),
                 target=target.view(-1).long()
-            ).mean()
+            ).view_as(x_1)  # [B, L]
+
+            mask = audio_att_mask.bool()
+            loss = (loss_per * mask).sum() / mask.sum().clamp_min(1)
 
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
@@ -649,7 +750,10 @@ class DFMTTSWrapper(L.LightningModule):
         # Iterate over each test sentence from config
         for idx, sentence in tqdm(enumerate(self.config.test.sentences), total=len(self.config.test.sentences)):
             print(f"\nGenerating audio for sentence: {sentence}")
-            augmented_sentence = text_ref + " " + sentence
+            # if text_ref has a final point, remove it for better concatenation
+            if text_ref.endswith("."):
+                text_ref = text_ref[:-1]
+            augmented_sentence = text_ref + ". " + sentence
 
             if isinstance(text_tokenizer, VoiceBpeTokenizer):
                 text_ids = torch.tensor(text_tokenizer.encode(augmented_sentence, lang="en-us")).to(self.device).unsqueeze(0)
@@ -676,13 +780,23 @@ class DFMTTSWrapper(L.LightningModule):
             print(f"Initial text_ids: {text_ids.shape}, {torch.min(text_ids)}, {torch.max(text_ids)}")
 
             if self.config.datasets.cond_drop_prob==0.0:
-                print("\n\tUsing simple_generate_sample_ctmc\n")
-                x_t = self.simple_generate_sample_ctmc(
-                    xt=x_t,
+                print("\n\n\t [ORIGINAL IMPLEMENTATION INFERENCE] Using simple_generate_sample_ctmc\n\n")
+                # x_t = self.simple_generate_sample_ctmc(
+                #     xt=x_t,
+                #     text_ids=text_ids,
+                #     codes_ref=codes_ref,
+                #     nsf=self.config.test.nsf,
+                #     codes_ref_size=codes_ref_size
+                # )
+                x_t = sample_with_official_solver(
+                    config=self.config,
+                    model=self,
                     text_ids=text_ids,
-                    codes_ref=codes_ref,
-                    nsf=self.config.test.nsf,
-                    codes_ref_size=codes_ref_size
+                    text_att_mask=None,
+                    codes_ref_1d=codes_ref.squeeze(0),
+                    suffix_len=codes_ref_size,
+                    steps=self.config.test.nsf,
+                    device=self.device,
                 )
             else:
                 if self.config.source_dist_type == "mask":
@@ -703,10 +817,9 @@ class DFMTTSWrapper(L.LightningModule):
                         nsf=self.config.test.nsf,
                         codes_ref_size=codes_ref_size
                     )
-
             codec_vocab = int(self.config.datasets.audio_vocab_size)  # 65536
-            mx = int(x_t.max().item())
-            mn = int(x_t.min().item())
+            mx = int(x_t.max(dim=-1).values.item())
+            mn = int(x_t.min(dim=-1).values.item())
             print(f"[DEBUG] decode input token range: min={mn} max={mx} codec_vocab={codec_vocab}")
             if mx >= codec_vocab:
                 bad = (x_t >= codec_vocab).sum().item()
@@ -714,6 +827,11 @@ class DFMTTSWrapper(L.LightningModule):
                 print("Removing bad tokens...")
                 # remove the tokens that are >= codec_vocab, and put the elements on the left
                 x_t = x_t[x_t < codec_vocab]
+            # if x_t is not in the shape (1, 1, T), reshape it
+            if x_t.dim() == 2:
+                x_t = x_t.unsqueeze(0)
+            elif x_t.dim() == 1:
+                x_t = x_t.unsqueeze(0).unsqueeze(0)
             generated_audio = audio_codec.decode_code(x_t)
             # Use a truncated version of the sentence for the log key (replace spaces with underscores)
             key = f"generated_audio_{idx}"

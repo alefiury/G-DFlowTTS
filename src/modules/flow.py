@@ -36,8 +36,13 @@ class SourceDistribution(ABC):
 
 
 class MaskedSourceDistribution(SourceDistribution):
-    def __init__(self, mask_token: int) -> None:
+    def __init__(self, mask_token: int, vocab_size: int) -> None:
         self.mask_token = mask_token
+        self.vocab_size = vocab_size
+        self.shape = (vocab_size,)
+
+    def __len__(self) -> int:
+        return self.vocab_size
 
     @property
     def masked(self) -> bool:
@@ -53,6 +58,10 @@ class MaskedSourceDistribution(SourceDistribution):
 class UniformSourceDistribution(SourceDistribution):
     def __init__(self, vocab_size: int) -> None:
         self.vocab_size = vocab_size
+        self.shape = (vocab_size,)
+
+    def __len__(self) -> int:
+        return self.vocab_size
 
     @property
     def masked(self) -> bool:
@@ -63,3 +72,22 @@ class UniformSourceDistribution(SourceDistribution):
 
     def sample_like(self, tensor_like: Tensor) -> Tensor:
         return torch.randint_like(tensor_like, high=self.vocab_size)
+
+
+def get_source_distribution(
+    source_distribution: str,
+    vocab_size: int,
+    mask_token: Optional[int] = None,
+) -> SourceDistribution:
+    if source_distribution == "uniform":
+        return UniformSourceDistribution(
+            vocab_size=vocab_size
+        )
+    elif source_distribution == "mask":
+        assert mask_token is not None, "mask_token must be provided for MaskedSourceDistribution."
+        return MaskedSourceDistribution(
+            mask_token=mask_token,
+            vocab_size=vocab_size,
+        )
+    else:
+        raise ValueError(f"Unknown source distribution type: {source_distribution}")

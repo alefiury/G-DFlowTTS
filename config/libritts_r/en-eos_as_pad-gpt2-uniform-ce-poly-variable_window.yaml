@@ -46,6 +46,12 @@ datasets:
     use_eos_as_pad: true
     loss_on_eos_pad: false
 
+    use_prefix_mask: true
+    fps: 50
+    prefix_min_sec: 0.25
+    prefix_max_sec: 12.0
+    prefix_ensure_min_gen_sec: 0.5
+
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
     text_vocab_size: ${datasets.text_vocab_size}
