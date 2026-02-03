@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES=0 python infer_librispeech_v5.py \
-    --config="/raid/aluno_alef/DFM-TTS-2/config/libritts_r/en-eos_as_pad-gpt2-mask-ce-poly-variable_window-pfg.yaml" \
-    --checkpoint="/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/cw5568eu/checkpoints/epoch=20-step=460000-val/loss_epoch=1.630.ckpt" \
+CUDA_VISIBLE_DEVICES=4 python infer_librispeech_v5.py \
+    --config="/raid/aluno_alef/DFM-TTS-2/config/emilia/en-eos_as_pad-gpt2-emilia_yodas-mask-ce-poly-variable_window-c_coupling.yaml" \
+    --checkpoint="/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/xykw1o75/checkpoints/epoch=01-step=650000-val/loss_epoch=3.886.ckpt" \
     --metadata_csv="/raid/aluno_alef/DATASETS/LibriSpeech-test-clean-filtered.csv" \
-    --output_dir="output_infer/cw5568eu-en-eos_as_pad-gpt2-mask-ce-poly-variable_window-pfg" \
+    --output_dir="output_infer/xykw1o75-en-eos_as_pad-gpt2-emilia_yodas-mask-ce-poly-variable_window-c_coupling" \
     --use_oracle_length \
-    --nsf=4,8,16,32,128,256,512,1024,2048
+    --nsf=4,8,16,32,128,256

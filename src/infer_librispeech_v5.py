@@ -376,6 +376,8 @@ def main():
         text = str(row["text"])
         text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
 
+        print(idx, "text:", text)
+
         filepath_codec = str(row["filepath_codec"])
         ref_filepath_codec = str(row["reference_codec"])
 

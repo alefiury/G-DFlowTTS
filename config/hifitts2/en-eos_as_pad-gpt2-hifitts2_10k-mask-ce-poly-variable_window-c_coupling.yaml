@@ -1,4 +1,4 @@
-title: DFMTTS-EmiliaYodas-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-HiFiTTS2_10k-NeuCodec-C-Coupling-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -15,7 +15,7 @@ datasets:
 
     text_tokenizer_name: "openai-community/gpt2"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
+    train_metadata: "/raid/aluno_alef/DATASETS/neucodec/hifitts2_train_10k.csv"
     val_metadata: ""
     base_dir: ""
     filepath_column: "filepath"
@@ -47,7 +47,7 @@ datasets:
     use_eos_as_pad: true
     loss_on_eos_pad: false
 
-    use_prefix_mask: false
+    use_prefix_mask: true
     fps: 50
     prefix_min_sec: 0.25
     prefix_max_sec: 12.0
@@ -88,6 +88,7 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
+    # max_steps: 500000
     max_steps: 1000000
     # max_epochs: 3
     num_sanity_val_steps: 2
@@ -96,7 +97,7 @@ trainer:
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
     val_check_interval: 50000
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 4
     precision: bf16
 
 model_checkpoint:
