@@ -1,0 +1,12 @@
+CUDA_VISIBLE_DEVICES=7 python infer_simplified.py \
+    --config="/raid/aluno_alef/DFM-TTS-2/config/emilia/en-eos_as_pad-gpt2-emilia_yodas-mask-ce-poly-variable_window-c_coupling-pfg.yaml" \
+    --checkpoint="/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/yrwxs6l7/checkpoints/epoch=01-step=880000-val/loss_epoch=3.937.ckpt" \
+    --metadata_csv="/raid/aluno_alef/utils_6/test_infer.csv" \
+    --output_dir="/raid/aluno_alef/DFM-TTS-2/src/output_infer/test_out" \
+    --nsf=2,4,8,16,32,64,128,256,512 \
+    --use_pfg \
+    --gamma=1.5 \
+    --use_remdm \
+    --remdm_eta_rescale 0.5 \
+    --remdm_eta_cap 0.5 \
+    --remdm_tswitch 0.0

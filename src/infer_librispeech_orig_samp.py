@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import argparse
 import warnings
@@ -12,6 +13,7 @@ from torch import Tensor
 import torch.nn.functional as F
 import pandas as pd
 import torchaudio
+from safetensors.torch import load_file
 from torchaudio import transforms as T
 from omegaconf import OmegaConf
 
@@ -163,7 +165,7 @@ def sample_with_official_solver(
         x_init=x_init,
         step_size=step_size,
         time_grid=time_grid,
-        verbose=True,
+        verbose=False,
         text_ids=text_ids,
         text_att_mask=text_att_mask,
         audio_att_mask=audio_att_mask,
@@ -285,6 +287,15 @@ def truncate_at_first_eos(tokens_1d: torch.Tensor, eos_id: Optional[int]) -> tor
     return tokens_1d[:first]
 
 
+def load_codes(filepath: str) -> torch.Tensor:
+    """
+    Load pre-extracted codes from disk (if you saved them as tensors).
+    Adjust this if you used a different saving format.
+    """
+    data = load_file(filepath)
+    return data["fsq_codes"]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
@@ -301,17 +312,8 @@ def main():
     parser.add_argument("--duration_config", type=str, default=None)
     parser.add_argument("--duration_ckpt", type=str, default=None)
 
-    # Sampling knobs
-    parser.add_argument("--x1_temp", type=float, default=1.0)
-    parser.add_argument("--temp_schedule", type=str, default="dfm36", choices=["dfm36", "constant"])
-    parser.add_argument("--remask_noise", type=float, default=0.0)
-
-    # PFG (only for checkpoints trained with cond_drop_prob > 0)
-    parser.add_argument("--use_pfg", action="store_true")
-    parser.add_argument("--gamma", type=float, default=2.5)
-
     parser.add_argument("--max_rows", type=int, default=-1)
-    parser.add_argument("--seed", type=int, default=0)
+    # parser.add_argument("--seed", type=int, default=0)
 
     args = parser.parse_args()
     # seed_everything(args.seed)
@@ -371,22 +373,30 @@ def main():
     print("EOS ID:", eos_id)
     print("MASK ID:", mask_id)
 
-    for idx, row in df.iterrows():
+    rtf_tuples = []
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
         # try:
         text = str(row["text"])
         text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
 
-        print(idx, "text:", text)
-
         filepath_codec = str(row["filepath_codec"])
-        ref_filepath_codec = str(row["reference_codec"])
+        filepath_codec = filepath_codec.replace("/xcodec2/LibriSpeech-test-clean-filtered/", "/neucodec/LibriSpeech/")
+        filepath_codec = filepath_codec.replace(".pt", ".safetensors")
 
-        target_filepath = str(row["filepath"])
-        reference_filepath = str(row["reference"])
+        ref_filepath_codec = str(row["reference_codec"])
+        ref_filepath_codec = ref_filepath_codec.replace("/xcodec2/LibriSpeech-test-clean-filtered/", "/neucodec/LibriSpeech/")
+        ref_filepath_codec = ref_filepath_codec.replace(".pt", ".safetensors")
+
+        assert os.path.exists(filepath_codec), f"File not found: {filepath_codec}"
+        assert os.path.exists(ref_filepath_codec), f"File not found: {ref_filepath_codec}"
+
+        # target_filepath = str(row["filepath"])
+        # reference_filepath = str(row["reference"])
 
         # Load reference codes (prefix)
         # codes_ref = torch.load(ref_filepath_codec).squeeze()
-        codes_ref = extract_codes(codec, reference_filepath).squeeze()
+        # codes_ref = extract_codes(codec, reference_filepath).squeeze()
+        codes_ref = load_codes(ref_filepath_codec).squeeze()
         if codes_ref.ndim != 1:
             codes_ref = codes_ref.reshape(-1)
         codes_ref = codes_ref.long().to(device)
@@ -398,14 +408,15 @@ def main():
         oracle_len = None
         if args.use_oracle_length:
             # oracle_codes = torch.load(filepath_codec).squeeze()
-            oracle_codes = extract_codes(codec, target_filepath).squeeze()
+            # oracle_codes = extract_codes(codec, target_filepath).squeeze()
+            oracle_codes = load_codes(filepath_codec).squeeze()
             if oracle_codes.ndim != 1:
                 oracle_codes = oracle_codes.reshape(-1)
             oracle_len = int(oracle_codes.numel())
             if args.oracle_add_eos:
                 oracle_len += 1
 
-        print(f"\n\n oracle_len: {oracle_len}-{oracle_len/50} \n\n")
+        # print(f"\n\n oracle_len: {oracle_len}-{oracle_len/50} \n\n")
 
         # Predict suffix length if needed
         if oracle_len is None:
@@ -430,6 +441,7 @@ def main():
                 continue
 
             with torch.no_grad():
+                start_time = time.time()
                 xt_full = sample_with_official_solver(
                     config=config,
                     model=model,
@@ -440,29 +452,36 @@ def main():
                     steps=steps,
                     device=device,
                 )
+                end_time = time.time()
+                total_pred_time = end_time - start_time
 
-                # Extract generated suffix
-                prefix_len = int(codes_ref.numel())
-                # save ref inside gen
-                ref_gen = xt_full[0, :prefix_len]
+            # Extract generated suffix
+            prefix_len = int(codes_ref.numel())
+            # save ref inside gen
+            ref_gen = xt_full[0, :prefix_len]
 
-                gen = xt_full[0, prefix_len:].detach().cpu()
+            gen = xt_full[0, prefix_len:].detach().cpu()
 
-                # Truncate at first EOS, then drop any remaining MASK (if any)
-                gen = truncate_at_first_eos(gen, eos_id)
-                gen = gen[gen != mask_id]
+            # Truncate at first EOS, then drop any remaining MASK (if any)
+            gen = truncate_at_first_eos(gen, eos_id)
+            gen = gen[gen != mask_id]
 
-                # Prepare shape for codec decode (matches your training wrapper usage)
-                gen_for_codec = gen.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,T]
+            # Prepare shape for codec decode (matches your training wrapper usage)
+            gen_for_codec = gen.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,T]
 
-                gen_for_codec = gen_for_codec.detach()
+            gen_for_codec = gen_for_codec.detach()
 
-                # Decode to waveform
-                wav = codec.decode_code(gen_for_codec).detach()
+            # Decode to waveform
+            wav = codec.decode_code(gen_for_codec).detach()
 
-                wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
-                out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
-                torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
+            total_wav_length = wav.shape[-1] / saving_sr
+            rtf = total_pred_time / total_wav_length if total_wav_length > 0 else float("inf")
+
+            rtf_tuples.append((idx, steps, total_pred_time, total_wav_length, rtf))
+
+            # wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
+            # out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
+            # torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
 
             # Save
             torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)
@@ -470,6 +489,10 @@ def main():
         # except Exception as e:
         #     print(f"[row {idx}] error: {e}")
         #     continue
+
+    # Save RTFs
+    rtf_df = pd.DataFrame(rtf_tuples, columns=["idx", "steps", "total_pred_time", "total_wav_length", "rtf"])
+    rtf_df.to_csv(os.path.join(args.output_dir, "rtf_results.csv"), index=False)
 
 
 if __name__ == "__main__":

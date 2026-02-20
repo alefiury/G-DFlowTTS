@@ -19,6 +19,8 @@ checkpoints/
 *.flac
 *.ogg
 *.ckpt
+*.safetensors
+*.csv
 
 # Distribution / packaging
 .Python

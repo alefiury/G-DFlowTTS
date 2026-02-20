@@ -641,9 +641,9 @@ def main():
                 # Decode to waveform
                 wav = codec.decode_code(gen_for_codec).detach()
 
-                wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
-                out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
-                torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
+                # wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
+                # out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
+                # torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
 
             # Save
             torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)

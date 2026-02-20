@@ -96,7 +96,7 @@ trainer:
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
     val_check_interval: 50000
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 4
     precision: bf16
 
 model_checkpoint:

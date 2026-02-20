@@ -14,11 +14,12 @@ Key fixes vs your current script:
 - Proper mask-absorbing dynamics: only MASK positions unmask (unless remask noise is enabled)
 - Safe EOS handling: truncate at first EOS (don’t delete all EOS blindly)
 """
-
+import time
 import os
 import math
 import argparse
 import warnings
+from safetensors.torch import load_file
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
@@ -212,12 +213,16 @@ def sample_mask_ctmc(
     # sampling knobs
     x1_temp: float = 1.0,
     temp_schedule: str = "constant",   # "dfm36" or "constant"
-    remask_noise: float = 0.0,      # adds stochastic remasking (optional)
+    remask_noise: float = 0.0,         # adds stochastic remasking (optional)
     use_pfg: bool = False,
-    gamma: float = 1.0,             # PFG strength in log-rate space; 1=conditional, 0=unconditional
+    gamma: float = 1.0,                # CFG/PFG scale: 0=uncond, 1=cond, >1 stronger
 ) -> torch.Tensor:
     """
-    Returns full sequence including prefix: [1, prefix_len + suffix_len]
+    Same as your original sampler, except:
+      - Guidance is now "normalized CFG/PFG in log-prob space":
+          logp_guided = logp_u + gamma * (logp_c - logp_u)
+          probs = softmax(logp_guided)
+    Everything else (mask-only unmasking, tau-leap jump, hazard, etc.) is unchanged.
     """
     S = total_vocab_size(config)
 
@@ -236,7 +241,6 @@ def sample_mask_ctmc(
     # add eos token at the end
     xt[0, -1] = eos_id
 
-    # attention mask for audio (all valid here; we are not padding inside sampler)
     audio_att_mask = torch.ones_like(xt, dtype=torch.bool, device=device)
 
     dt = 1.0 / max(1, int(steps))
@@ -244,7 +248,6 @@ def sample_mask_ctmc(
 
     def temp_at(t_lin: float) -> float:
         if temp_schedule == "dfm36":
-            # Eq. (36) style schedule: T(t) = x1_temp * (1-t)^2
             return max(1e-3, float(x1_temp) * (1.0 - float(t_lin)) ** 2)
         return max(1e-3, float(x1_temp))
 
@@ -272,7 +275,9 @@ def sample_mask_ctmc(
         # temperature
         Tsoft = temp_at(t_lin)
 
-        # unconditional / conditional logits
+        # ----------------------------
+        # Model forward (cond / uncond)
+        # ----------------------------
         logits_c = model(
             x_t=xt,
             text_ids=text_ids,
@@ -281,14 +286,6 @@ def sample_mask_ctmc(
             text_att_mask=text_att_mask,
             audio_att_mask=audio_att_mask,
         ).float()
-
-        # forbid PAD token if it exists (do NOT treat EOS-as-PAD as forbidden)
-        # if pad_id is not None and not bool(getattr(config.datasets, "use_eos_as_pad", False)):
-        #     logits_c[..., pad_id] = -torch.inf
-
-        probs_c = torch.softmax(logits_c / Tsoft, dim=-1)
-
-        # print(probs_c)
 
         if use_pfg:
             logits_u = model(
@@ -299,84 +296,55 @@ def sample_mask_ctmc(
                 text_att_mask=text_att_mask,
                 audio_att_mask=audio_att_mask,
             ).float()
-            if pad_id is not None and not bool(getattr(config.datasets, "use_eos_as_pad", False)):
-                logits_u[..., pad_id] = -torch.inf
-            probs_u = torch.softmax(logits_u / Tsoft, dim=-1)
+
+            # ----------------------------
+            # NORMALIZED CFG/PFG IN LOG-PROB SPACE
+            #   logp_guided = logp_u + gamma * (logp_c - logp_u)
+            #   probs = softmax(logp_guided)
+            # ----------------------------
+            logp_c = F.log_softmax(logits_c / Tsoft, dim=-1)
+            logp_u = F.log_softmax(logits_u / Tsoft, dim=-1)
+            logp_guided = logp_u + float(gamma) * (logp_c - logp_u)
+            probs = torch.softmax(logp_guided, dim=-1)
         else:
-            probs_u = None
+            probs = torch.softmax(logits_c / Tsoft, dim=-1)
 
-        # Avoid sampling MASK as a target token (should already be near-zero, but make it explicit)
-        probs_c[..., mask_id] = 0.0
-        probs_c = probs_c / probs_c.sum(dim=-1, keepdim=True).clamp_min(eps)
-        if probs_u is not None:
-            probs_u[..., mask_id] = 0.0
-            probs_u = probs_u / probs_u.sum(dim=-1, keepdim=True).clamp_min(eps)
+        # Avoid sampling MASK as a target token
+        probs[..., mask_id] = 0.0
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-        # print("1"*100)
-
-        # Build rates:
+        # ----------------------------
+        # Build rates (same as your original)
         # For mask-source, only masked positions unmask with rate = lam * p(token).
+        # ----------------------------
         xt_is_mask = (xt == mask_id).unsqueeze(-1).float()  # [1,T,1]
-
-        # print("2"*100)
-
         base_r = (1.0 + float(remask_noise) * float(t_lin)) * lam_scalar  # scalar
 
-        # print("3"*100)
-
-        R_c = xt_is_mask * probs_c * base_r  # [1,T,S]
-
-        # print("4"*100)
-
-        if use_pfg:
-            R_u = xt_is_mask * probs_u * base_r
-        else:
-            R_u = None
+        R_mix = xt_is_mask * probs * base_r  # [1,T,S]
 
         # Optional remasking noise: allow non-mask -> mask transitions.
-        # This is *not* part of the pure mixture path, but can add stochasticity.
+        # Same behavior as your original (just applied after guidance now).
         if remask_noise > 0.0:
-            mask_one_hot = torch.zeros((S,), device=device, dtype=R_c.dtype)
+            mask_one_hot = torch.zeros((S,), device=device, dtype=R_mix.dtype)
             mask_one_hot[mask_id] = 1.0
             xt_not_mask = (1.0 - xt_is_mask)  # [1,T,1]
-            R_c = R_c + xt_not_mask * mask_one_hot.view(1, 1, S) * float(remask_noise)
-            if R_u is not None:
-                R_u = R_u + xt_not_mask * mask_one_hot.view(1, 1, S) * float(remask_noise)
-
-        # print("5"*100)
-
-        # PFG mixing in log-rate space: R_mix ∝ R_c^gamma * R_u^(1-gamma)
-        if use_pfg:
-            logRc = torch.log(R_c + 1e-9)
-            logRu = torch.log(R_u + 1e-9)
-            R_mix = torch.exp(float(gamma) * logRc + (1.0 - float(gamma)) * logRu)
-        else:
-            R_mix = R_c
-
-        # print("6"*100)
+            R_mix = R_mix + xt_not_mask * mask_one_hot.view(1, 1, S) * float(remask_noise)
 
         # Remove diagonal (no self-jumps)
         R_off = R_mix.clone()
         R_off.scatter_(-1, xt[..., None], 0.0)
 
-        # print("7"*100)
-
         # Total hazard per position
         hazard = R_off.sum(dim=-1)  # [1,T]
-
-        # print("8"*100)
 
         # Jump probability for each position
         p_jump = 1.0 - torch.exp(-dt * hazard)  # [1,T]
         do_jump = (torch.rand_like(p_jump) < p_jump)  # [1,T] bool
 
-        # print("9"*100)
-
         # Never jump on the pinned prefix
         do_jump[:, :prefix_len] = False
 
         if do_jump.any():
-            # Build jump distributions only where hazard > 0 AND do_jump==True
             hazard_safe = hazard.clamp_min(1e-9)                     # [1,T]
             q = R_off / hazard_safe.unsqueeze(-1)                    # [1,T,S]
 
@@ -384,7 +352,6 @@ def sample_mask_ctmc(
             jump_idx = do_jump.view(-1).nonzero(as_tuple=False).squeeze(-1)  # [Nj]
 
             q_jump = q2.index_select(0, jump_idx)                    # [Nj,S]
-            # sanitize numerics
             q_jump = torch.nan_to_num(q_jump, nan=0.0, posinf=0.0, neginf=0.0)
             q_jump = q_jump.clamp_min(0.0)
             q_jump = q_jump / q_jump.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -395,21 +362,10 @@ def sample_mask_ctmc(
             xt_flat[jump_idx] = sampled.to(xt_flat.dtype)
             xt = xt_flat.view_as(xt)
 
-        # print("10"*100)
-
-        # Always re-pin prefix
-        # xt[:, :prefix_len] = codes_ref_1d.unsqueeze(0)
-
-        # count number of masked positions in suffix
-        num_masked = (xt[:, prefix_len:] == mask_id).sum().item()
-        # print(f"Step {k+1}/{steps}, masked positions in suffix: {num_masked}")
-
-        # print("11"*100)
-
         # Optional early stop if everything (suffix) is unmasked and no remasking
         if remask_noise <= 0.0:
             if (xt[:, prefix_len:] == mask_id).sum().item() == 0:
-                print(f"All positions unmasked at step {k+1}/{steps}, stopping early.")
+                # print(f"All positions unmasked at step {k+1}/{steps}, stopping early.")
                 break
 
     return xt
@@ -455,6 +411,16 @@ def extract_codes(model: NeuCodec, filepath: str) -> torch.Tensor:
         fsq_codes = model.encode_code(y)  # (1, T_code)
 
     return fsq_codes.squeeze(0).cpu()
+
+
+def load_codes(filepath: str) -> torch.Tensor:
+    """
+    Load pre-extracted codes from disk (if you saved them as tensors).
+    Adjust this if you used a different saving format.
+    """
+    data = load_file(filepath)
+    return data["fsq_codes"]
+
 
 
 def main():
@@ -540,79 +506,90 @@ def main():
     eos_id = int(getattr(config.datasets, "audio_eos_token", -1))
     mask_id = int(getattr(config.datasets, "audio_mask_token", -1))
 
-    for idx, row in df.iterrows():
-        # try:
-        text = str(row["text"])
-        text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
+    rtf_tuples = []
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        try:
+            text = str(row["text"])
+            text_ref = str(row["ref_text"]) if not pd.isna(row["ref_text"]) else None
 
-        filepath_codec = str(row["filepath_codec"])
-        ref_filepath_codec = str(row["reference_codec"])
+            filepath_codec = str(row["filepath_codec"])
+            filepath_codec = filepath_codec.replace("/xcodec2/LibriSpeech-test-clean-filtered/", "/neucodec/LibriSpeech/")
+            filepath_codec = filepath_codec.replace(".pt", ".safetensors")
 
-        target_filepath = str(row["filepath"])
-        reference_filepath = str(row["reference"])
+            ref_filepath_codec = str(row["reference_codec"])
+            ref_filepath_codec = ref_filepath_codec.replace("/xcodec2/LibriSpeech-test-clean-filtered/", "/neucodec/LibriSpeech/")
+            ref_filepath_codec = ref_filepath_codec.replace(".pt", ".safetensors")
 
-        # Load reference codes (prefix)
-        # codes_ref = torch.load(ref_filepath_codec).squeeze()
-        codes_ref = extract_codes(codec, reference_filepath).squeeze()
-        if codes_ref.ndim != 1:
-            codes_ref = codes_ref.reshape(-1)
-        codes_ref = codes_ref.long().to(device)
+            assert os.path.exists(filepath_codec), f"File not found: {filepath_codec}"
+            assert os.path.exists(ref_filepath_codec), f"File not found: {ref_filepath_codec}"
 
-        # Build text inputs using the SAME tokenizer as training
-        text_ids, text_att_mask, _tok = build_text_inputs(config, text, text_ref, device)
+            # Load reference codes (prefix)
+            # codes_ref = torch.load(ref_filepath_codec).squeeze()
+            # codes_ref = extract_codes(codec, reference_filepath).squeeze()
+            codes_ref = load_codes(ref_filepath_codec).squeeze()
+            if codes_ref.ndim != 1:
+                codes_ref = codes_ref.reshape(-1)
+            codes_ref = codes_ref.long().to(device)
 
-        # Oracle length (suffix length)
-        oracle_len = None
-        if args.use_oracle_length:
-            # oracle_codes = torch.load(filepath_codec).squeeze()
-            oracle_codes = extract_codes(codec, target_filepath).squeeze()
-            if oracle_codes.ndim != 1:
-                oracle_codes = oracle_codes.reshape(-1)
-            oracle_len = int(oracle_codes.numel())
-            if args.oracle_add_eos:
-                oracle_len += 1
+            # Build text inputs using the SAME tokenizer as training
+            text_ids, text_att_mask, _tok = build_text_inputs(config, text, text_ref, device)
 
-        print(f"\n\n oracle_len: {oracle_len}-{oracle_len/50} \n\n")
+            # Oracle length (suffix length)
+            oracle_len = None
+            if args.use_oracle_length:
+                # oracle_codes = torch.load(filepath_codec).squeeze()
+                # oracle_codes = extract_codes(codec, filepath_codec).squeeze()
+                oracle_codes =  load_codes(filepath_codec).squeeze()
+                if oracle_codes.ndim != 1:
+                    oracle_codes = oracle_codes.reshape(-1)
+                oracle_len = int(oracle_codes.numel())
+                if args.oracle_add_eos:
+                    oracle_len += 1
 
-        # Predict suffix length if needed
-        if oracle_len is None:
-            # suffix_len = get_remaining_duration(
-            #     duration_model=duration_model,
-            #     text_ids=text_ids,
-            #     codes_ref_1d=codes_ref,
-            #     config=config,
-            #     device=device,
-            # )
-            suffix_len = 2048
-            print(f"[row {idx}] using fixed suffix length: {suffix_len}")
-        else:
-            suffix_len = oracle_len
+            # print(f"\n\n oracle_len: {oracle_len}-{oracle_len/50} \n\n")
 
-        # print(f"\n\n suffix_len:{suffix_len}-{suffix_len/50} \n\n")
+            # Predict suffix length if needed
+            if oracle_len is None:
+                # suffix_len = get_remaining_duration(
+                #     duration_model=duration_model,
+                #     text_ids=text_ids,
+                #     codes_ref_1d=codes_ref,
+                #     config=config,
+                #     device=device,
+                # )
+                suffix_len = 2048
+                # print(f"[row {idx}] using fixed suffix length: {suffix_len}")
+            else:
+                suffix_len = oracle_len
 
-        for steps in steps_list:
-            # print(f"\n\n suffix_len:{suffix_len}  | {steps}\n\n")
-            out_wav = os.path.join(args.output_dir, f"audio_{idx}-nsf{steps}.wav")
-            if os.path.exists(out_wav):
-                continue
+            # print(f"\n\n suffix_len:{suffix_len}-{suffix_len/50} \n\n")
 
-            with torch.no_grad():
-                xt_full = sample_mask_ctmc(
-                    config=config,
-                    model=model,
-                    path=path,
-                    text_ids=text_ids,
-                    text_att_mask=text_att_mask,
-                    codes_ref_1d=codes_ref,
-                    suffix_len=suffix_len,
-                    steps=steps,
-                    device=device,
-                    x1_temp=float(args.x1_temp),
-                    temp_schedule=str(args.temp_schedule),
-                    remask_noise=float(args.remask_noise),
-                    use_pfg=bool(args.use_pfg),
-                    gamma=float(args.gamma),
-                )
+            for steps in steps_list:
+                # print(f"\n\n suffix_len:{suffix_len}  | {steps}\n\n")
+                out_wav = os.path.join(args.output_dir, f"audio_{idx}-nsf{steps}.wav")
+                if os.path.exists(out_wav):
+                    continue
+
+                with torch.no_grad():
+                    start_time = time.time()
+                    xt_full = sample_mask_ctmc(
+                        config=config,
+                        model=model,
+                        path=path,
+                        text_ids=text_ids,
+                        text_att_mask=text_att_mask,
+                        codes_ref_1d=codes_ref,
+                        suffix_len=suffix_len,
+                        steps=steps,
+                        device=device,
+                        x1_temp=float(args.x1_temp),
+                        temp_schedule=str(args.temp_schedule),
+                        remask_noise=float(args.remask_noise),
+                        use_pfg=bool(args.use_pfg),
+                        gamma=float(args.gamma),
+                    )
+                    end_time = time.time()
+                    total_pred_time = end_time - start_time
 
                 # Extract generated suffix
                 prefix_len = int(codes_ref.numel())
@@ -633,16 +610,25 @@ def main():
                 # Decode to waveform
                 wav = codec.decode_code(gen_for_codec).detach()
 
-                wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
-                out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
-                torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
+                # wav_ref = codec.decode_code(ref_gen.unsqueeze(0).unsqueeze(0)).detach()
+                # out_gen_ref = os.path.join(args.output_dir, f"gen_ref_{idx}-nsf{steps}.wav")
+                # torchaudio.save(out_gen_ref, wav_ref.squeeze(0).cpu(), saving_sr)
 
-            # Save
-            torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)
+                total_wav_length = wav.shape[-1] / saving_sr
 
-        # except Exception as e:
-        #     print(f"[row {idx}] error: {e}")
-        #     continue
+                rtf = total_pred_time / total_wav_length if total_wav_length > 0 else float("inf")
+                # Save
+                torchaudio.save(out_wav, wav.squeeze(0).cpu(), saving_sr)
+        except Exception as e:
+            print(f"[row {idx}] error: {e}")
+            rtf = float("inf")
+            continue
+
+        rtf_tuples.append((idx, rtf))
+
+    # Save RTFs
+    rtf_df = pd.DataFrame(rtf_tuples, columns=["idx", "rtf"])
+    rtf_df.to_csv(os.path.join(args.output_dir, "rtf_results.csv"), index=False)
 
 
 if __name__ == "__main__":
