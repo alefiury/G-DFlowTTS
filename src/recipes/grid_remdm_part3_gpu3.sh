@@ -5,8 +5,8 @@ export CUDA_VISIBLE_DEVICES=7
 
 CONFIG="/raid/aluno_alef/DFM-TTS-2/config/emilia/en-eos_as_pad-gpt2-emilia_yodas-mask-ce-poly-variable_window-c_coupling-pfg.yaml"
 CKPT="/raid/aluno_alef/DFM-TTS-2/src/DFM-TTS/yrwxs6l7/checkpoints/epoch=01-step=880000-val/loss_epoch=3.937.ckpt"
-META="/raid/aluno_alef/DATASETS/LibriSpeech-test-clean-filtered.csv"
-BASE_OUT="/raid/aluno_alef/DFM-TTS-2/src/output_infer/yrwxs6l7_grid_remdm_4gpu_full"
+META="/raid/aluno_alef/DATASETS/LibriSpeech-dev-clean-filtered.csv"
+BASE_OUT="/raid/aluno_alef/DFM-TTS-2/src/output_infer/yrwxs6l7_grid_remdm_4gpu_full-dev_clean"
 
 NSF="2,4,8,16,32,64,128"
 GAMMAS=(1.5)

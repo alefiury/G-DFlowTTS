@@ -491,7 +491,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to Lightning .ckpt.")
-    parser.add_argument("--metadata_csv", type=str, required=True,
+    parser.add_argument("--metadata_csv", type=str, required=False,
                         help="CSV with columns: text, ref_text, filepath_codec, reference_codec")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--gpu", type=int, default=0)
@@ -567,15 +567,27 @@ def main():
     codec, saving_sr = load_codec(config, device)
 
     # Read metadata
-    df = pd.read_csv(args.metadata_csv)
+    # df = pd.read_csv(args.metadata_csv)
 
-    ref_texts = df["ref_text"].fillna("").tolist()
-    target_texts = df["text"].fillna("").tolist()
+    # ref_texts = df["ref_text"].fillna("").tolist()
+    # target_texts = df["text"].fillna("").tolist()
 
-    ref_filepaths = df["reference_filepath"].tolist()
+    # ref_filepaths = df["reference_filepath"].tolist()
+
+    # ref_texts = ["Some call me nature. Others call me Mother Nature"]
+    # target_texts = ["I don't really care what you call me. I've been a silent spectator, watching species evolve, empires rise and fall. But always remember, I am mighty and enduring."]
+    # ref_filepaths = ["prompt_01.wav"]
+
+    # ref_texts = ["Are you familiar with it? Slice the steak and place the strips on top, then garnish with the dried cranberries, pine nuts, and blue cheese!"]
+    # target_texts = ["Perhaps they are driven by the delicious blend of flavors, or it could be the appealing visual presentation. At the end of the day, our choices in food reflect our personal preferences."]
+    # ref_filepaths = ["prompt_02.wav"]
+
+    ref_texts = ["Kids are talking by the door.", "Kids are talking by the door."]
+    target_texts = ["I just received wonderful news about the promotion I have been waiting for!", "I just received wonderful news about the promotion I have been waiting for!"]
+    ref_filepaths = ["ravdess/happy_01.wav", "ravdess/happy_02.wav"]
 
     rtf_tuples = []
-    for idx, (row, ref_text, target_text, ref_filepath) in enumerate(zip(df.itertuples(), ref_texts, target_texts, ref_filepaths)):
+    for idx, (ref_text, target_text, ref_filepath) in enumerate(zip(ref_texts, target_texts, ref_filepaths)):
         # text input
         text_ids, text_att_mask, _tok = build_text_inputs(config, ref_text, target_text, device)
 
