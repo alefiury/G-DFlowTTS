@@ -45,6 +45,7 @@ from dataset.dataloader import (
     OfflineMultipleSpeakerDreamOnCollateFunc,
     OfflineVoiceCloningSimplifiedCollateFunc,
     HFTextTokenizerCollator,
+    StreamingHFTextTokenizerCollator,
     PhonemeTokenizerCollator,
 )
 
@@ -106,12 +107,16 @@ class DFMTTSWrapper(L.LightningModule):
         else:
             raise ValueError(f"Invalid model type: {self.config.model_type}")
 
-        if config.datasets.type == "dynamic":
+        if config.datasets.type in ["dynamic", "hf_streaming_text_tokenizer"]:
             if config.datasets.get("codec_name", "") == "xcodec2":
-                self.audio_codec = XCodec2Model.from_pretrained(self.config.datasets.audio_codec)
+                self.audio_codec = XCodec2Model.from_pretrained(
+                    self.config.datasets.audio_codec
+                )
             elif config.datasets.get("codec_name", "") == "neucodec":
-                model = NeuCodec.from_pretrained("neuphonic/neucodec")
-                model.eval().cuda()
+                # Do not call .cuda() here; Lightning owns device placement.
+                self.audio_codec = NeuCodec.from_pretrained("neuphonic/neucodec")
+                self.audio_codec.eval()
+                self.audio_codec.requires_grad_(False)
             else:
                 raise ValueError(f"Invalid codec name: {config.datasets.codec_name}")
 
@@ -126,6 +131,44 @@ class DFMTTSWrapper(L.LightningModule):
         # Assign train/val datasets for use in dataloaders
         if stage == "fit":
             self.train_dataset, self.val_dataset = build_dataset(self.config)
+
+            # Iterable datasets do not get a DistributedSampler. Split the
+            # streamed shards/examples explicitly across DDP ranks.
+            if (
+                self.config.datasets.type == "hf_streaming_text_tokenizer"
+                and self.trainer.world_size > 1
+            ):
+                from datasets.distributed import split_dataset_by_node
+
+                self.train_dataset = split_dataset_by_node(
+                    self.train_dataset,
+                    rank=self.global_rank,
+                    world_size=self.trainer.world_size,
+                )
+                if self.val_dataset is not None:
+                    self.val_dataset = split_dataset_by_node(
+                        self.val_dataset,
+                        rank=self.global_rank,
+                        world_size=self.trainer.world_size,
+                    )
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        """Keep raw streamed audio on CPU for NeuCodec preprocessing.
+
+        NeuCodec's feature extractor converts the raw waveform to NumPy/CPU
+        before moving extracted features to the codec device.  Moving the
+        waveform to CUDA here would either fail with older NeuCodec versions
+        or cause an unnecessary CPU -> GPU -> CPU round trip.
+        """
+        if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            waveforms, transcription_ids, transcription_att_mask = batch
+            return (
+                waveforms,
+                transcription_ids.to(device, non_blocking=True),
+                transcription_att_mask.to(device, non_blocking=True),
+            )
+
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
     def train_dataloader(self):
         """Return the training dataloader."""
@@ -176,6 +219,24 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_pad_type=self.config.datasets.audio_pad_type,
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
             )
+        elif self.config.datasets.type == "hf_streaming_text_tokenizer":
+            print("\n\n\tUsing streaming Parquet + HF Text Tokenizer collator!\n\n")
+
+            text_tokenizer = AutoTokenizer.from_pretrained(
+                self.config.datasets.text_tokenizer_name
+            )
+            if text_tokenizer.pad_token is None:
+                text_tokenizer.add_special_tokens(
+                    {"pad_token": text_tokenizer.eos_token}
+                )
+
+            collate_fn = StreamingHFTextTokenizerCollator(
+                text_tokenizer=text_tokenizer,
+                text_column=self.config.datasets.text_column,
+                audio_column=self.config.datasets.get("audio_column", "audio"),
+                sampling_rate=self.config.datasets.sampling_rate,
+                max_audio_duration=self.config.datasets.max_audio_duration,
+            )
         elif self.config.datasets.type == "hf_text_tokenizer":
             print("\n\n\tUsing HF Text Tokenizer Collator for training dataloader!\n\n")
 
@@ -209,13 +270,20 @@ class DFMTTSWrapper(L.LightningModule):
         return torch.utils.data.DataLoader(
             self.train_dataset,
             batch_size=self.config.train.batch_size,
-            shuffle=self.config.train.shuffle,
+            shuffle=(
+                False
+                if self.config.datasets.type == "hf_streaming_text_tokenizer"
+                else self.config.train.shuffle
+            ),
             num_workers=self.config.train.num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
         )
 
     def val_dataloader(self):
+        if getattr(self, "val_dataset", None) is None:
+            return None
+
         if self.config.datasets.type == "dynamic":
             collate_fn = DynamicSingleSpeakerCollateFunc()
         elif self.config.datasets.type == "offline":
@@ -262,6 +330,24 @@ class DFMTTSWrapper(L.LightningModule):
                 text_pad_token=self.config.datasets.text_pad_token,
                 audio_pad_type=self.config.datasets.audio_pad_type,
                 use_eos_as_pad=self.config.datasets.use_eos_as_pad,
+            )
+        elif self.config.datasets.type == "hf_streaming_text_tokenizer":
+            print("\n\n\tUsing streaming Parquet + HF Text Tokenizer validation collator!\n\n")
+
+            text_tokenizer = AutoTokenizer.from_pretrained(
+                self.config.datasets.text_tokenizer_name
+            )
+            if text_tokenizer.pad_token is None:
+                text_tokenizer.add_special_tokens(
+                    {"pad_token": text_tokenizer.eos_token}
+                )
+
+            collate_fn = StreamingHFTextTokenizerCollator(
+                text_tokenizer=text_tokenizer,
+                text_column=self.config.datasets.text_column,
+                audio_column=self.config.datasets.get("audio_column", "audio"),
+                sampling_rate=self.config.datasets.sampling_rate,
+                max_audio_duration=self.config.datasets.max_audio_duration,
             )
         elif self.config.datasets.type == "hf_text_tokenizer":
             print("\n\n\tUsing HF Text Tokenizer Collator for validation dataloader!\n\n")
@@ -440,6 +526,97 @@ class DFMTTSWrapper(L.LightningModule):
             speech_tokens = speech_tokens.squeeze(1)
         return speech_tokens.long()
 
+    @torch.no_grad()
+    def encode_streaming_waveforms(self, waveforms):
+        """Encode variable-length raw utterances and reproduce offline padding."""
+        if self.config.datasets.codec_name != "neucodec":
+            raise NotImplementedError(
+                "Raw Parquet streaming is currently implemented for NeuCodec."
+            )
+
+        # Lightning calls train() recursively on submodules; force the frozen
+        # codec back to eval mode before extracting discrete targets.
+        self.audio_codec.eval()
+
+        code_list = []
+        for waveform in waveforms:
+            # Keep raw audio on CPU. Older NeuCodec versions call a Hugging
+            # Face feature extractor that converts this tensor to NumPy. The
+            # codec itself moves acoustic/semantic tensors to self.device.
+            waveform = waveform.detach().to(device="cpu", dtype=torch.float32)
+            if waveform.ndim == 2:
+                waveform = waveform.unsqueeze(0)  # [1, 1, T]
+            if waveform.ndim != 3:
+                raise ValueError(
+                    f"NeuCodec input must be [B,1,T], got {tuple(waveform.shape)}"
+                )
+
+            codes = self.audio_codec.encode_code(waveform).squeeze().long()
+            if codes.ndim != 1:
+                raise ValueError(
+                    f"Expected 1-D NeuCodec sequence, got {tuple(codes.shape)}"
+                )
+            code_list.append(codes)
+
+        if self.config.datasets.audio_pad_type == "variable":
+            max_audio_length = max(code.numel() + 1 for code in code_list)
+            max_audio_length = min(
+                max_audio_length,
+                self.config.datasets.max_audio_length,
+            )
+        elif self.config.datasets.audio_pad_type == "fixed":
+            max_audio_length = self.config.datasets.max_audio_length
+        else:
+            raise ValueError(
+                f"Unknown audio_pad_type: {self.config.datasets.audio_pad_type}"
+            )
+
+        effective_pad_id = (
+            self.config.datasets.audio_eos_token
+            if self.config.datasets.use_eos_as_pad
+            else self.config.datasets.audio_pad_token
+        )
+        if effective_pad_id is None:
+            raise ValueError(
+                "audio_pad_token must be set when use_eos_as_pad is false"
+            )
+
+        padded_codes = []
+        lengths_with_eos = []
+        for codes in code_list:
+            # Reserve one slot for the gold EOS token.
+            codes = codes[: max_audio_length - 1]
+            sequence = torch.cat(
+                [
+                    codes,
+                    torch.tensor(
+                        [self.config.datasets.audio_eos_token],
+                        dtype=codes.dtype,
+                        device=codes.device,
+                    ),
+                ]
+            )
+            lengths_with_eos.append(sequence.numel())
+
+            if sequence.numel() < max_audio_length:
+                sequence = F.pad(
+                    sequence,
+                    (0, max_audio_length - sequence.numel()),
+                    value=effective_pad_id,
+                )
+            padded_codes.append(sequence)
+
+        x_1 = torch.stack(padded_codes, dim=0)
+        lengths = torch.tensor(
+            lengths_with_eos,
+            dtype=torch.long,
+            device=x_1.device,
+        )
+        positions = torch.arange(x_1.size(1), device=x_1.device).unsqueeze(0)
+        audio_att_mask = positions < lengths.unsqueeze(1)
+
+        return x_1, audio_att_mask
+
     def build_keep_prefix(
         self,
         x1: torch.Tensor,                 # [B, L]
@@ -495,7 +672,11 @@ class DFMTTSWrapper(L.LightningModule):
         )
 
     def training_step(self, batch, batch_idx):
-        if self.config.datasets.type == "dynamic":
+        if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            input_waveforms, transcription_ids, transcription_att_mask = batch
+            x_1, audio_att_mask = self.encode_streaming_waveforms(input_waveforms)
+            x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
+        elif self.config.datasets.type == "dynamic":
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
         else:
@@ -600,7 +781,11 @@ class DFMTTSWrapper(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if self.config.datasets.type == "dynamic":
+        if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            input_waveforms, transcription_ids, transcription_att_mask = batch
+            x_1, audio_att_mask = self.encode_streaming_waveforms(input_waveforms)
+            x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
+        elif self.config.datasets.type == "dynamic":
             input_waveform, input_features, transcription_ids = batch
             x_1 = self.get_speech_token(input_waveform, input_features)
         else:
@@ -690,7 +875,7 @@ class DFMTTSWrapper(L.LightningModule):
 
         self.log("val/loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
-        if batch_idx == 0:
+        if batch_idx == 0 and self.config.test.get("log_audio_ref", False):
             try:
                 self.sample_validation()
             except Exception as e:
@@ -733,7 +918,7 @@ class DFMTTSWrapper(L.LightningModule):
         print(f"Padded codes reference shape: {codes_ref.shape}")
         codes_ref = codes_ref.unsqueeze(0).to(self.device)
 
-        if self.config.datasets.type == "hf_text_tokenizer":
+        if self.config.datasets.type in ["hf_text_tokenizer", "hf_streaming_text_tokenizer"]:
             text_tokenizer = AutoTokenizer.from_pretrained(self.config.datasets.text_tokenizer_name)
             if text_tokenizer.pad_token is None:
                 text_tokenizer.add_special_tokens({"pad_token": text_tokenizer.eos_token})

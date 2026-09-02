@@ -1132,6 +1132,100 @@ class HFTextTokenizerCollator:
         return x_1, x_1_att_mask, transcription_padded, transcription_att_mask
 
 
+class StreamingHFTextTokenizerCollator:
+    """Collate streamed Parquet rows into raw 16-kHz utterances + text tokens.
+
+    Codec tokenization intentionally stays out of DataLoader workers and is run
+    by the LightningModule on the training device. This avoids loading a large
+    NeuCodec model once per worker and preserves per-utterance codec padding.
+    """
+
+    def __init__(
+        self,
+        text_tokenizer: AutoTokenizer,
+        text_column: str,
+        audio_column: str = "audio",
+        sampling_rate: int = 16_000,
+        max_audio_duration: Optional[float] = None,
+    ):
+        self.text_tokenizer = text_tokenizer
+        self.text_column = text_column
+        self.audio_column = audio_column
+        self.sampling_rate = sampling_rate
+        self.max_audio_frames = (
+            int(max_audio_duration * sampling_rate)
+            if max_audio_duration is not None
+            else None
+        )
+
+    def _prepare_waveform(self, audio) -> torch.Tensor:
+        waveform = torch.tensor(audio["array"], dtype=torch.float32)
+        source_sr = int(audio["sampling_rate"])
+
+        # Hugging Face Audio is normally mono here, but keep stereo robust.
+        if waveform.ndim == 2:
+            waveform = waveform.mean(dim=0)
+        if waveform.ndim != 1:
+            raise ValueError(
+                f"Expected mono waveform, got shape {tuple(waveform.shape)}"
+            )
+
+        if source_sr != self.sampling_rate:
+            waveform = torchaudio.functional.resample(
+                waveform,
+                source_sr,
+                self.sampling_rate,
+            )
+
+        if self.max_audio_frames is not None:
+            waveform = waveform[: self.max_audio_frames]
+
+        if waveform.numel() == 0:
+            raise ValueError("Encountered an empty waveform in streamed dataset")
+
+        # [1, T]; Lightning will move tensors inside this list to the device.
+        return waveform.unsqueeze(0)
+
+    def __call__(self, batch):
+        waveforms = []
+        transcriptions = []
+
+        for sample in batch:
+            transcription = sample.get(self.text_column)
+
+            # print("="*100)
+            # print(transcription)
+
+            if transcription is None or not str(transcription).strip():
+                # print("="*100)
+                # print(transcription)
+                # raise ValueError(
+                #     f"Empty transcription in column '{self.text_column}'. "
+                #     "Choose a populated text column in the YAML config."
+                # )
+
+                transcription = "..."
+
+                print(f"Empty transcription in column '{self.text_column}'.")
+
+            waveforms.append(
+                self._prepare_waveform(sample[self.audio_column])
+            )
+            transcriptions.append(str(transcription))
+
+        transcription_encodings = self.text_tokenizer(
+            transcriptions,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        return (
+            waveforms,
+            transcription_encodings["input_ids"],
+            transcription_encodings["attention_mask"].bool(),
+        )
+
+
 class PhonemesDataset(torch.utils.data.Dataset):
     def __init__(
         self,

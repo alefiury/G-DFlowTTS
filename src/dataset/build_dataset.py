@@ -3,6 +3,7 @@ from typing import Tuple
 
 from tqdm import tqdm
 import pandas as pd
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
@@ -16,6 +17,52 @@ from dataset.dataloader import (
 
 
 def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
+    # Streaming Parquet path: keep the Hugging Face IterableDataset lazy and
+    # avoid materializing metadata/audio in RAM.
+    if config.datasets.type == "hf_streaming_text_tokenizer":
+        val_metadata = config.datasets.get("val_metadata", "")
+
+        data_files = {
+            "train": config.datasets.train_metadata,
+        }
+        if val_metadata:
+            data_files["validation"] = val_metadata
+
+        dataset = load_dataset(
+            "parquet",
+            data_files=data_files,
+            streaming=True,
+        )
+
+        train_dataset = dataset["train"]
+        val_dataset = dataset["validation"] if val_metadata else None
+
+        # torch DataLoader cannot randomly shuffle an IterableDataset.
+        # Shuffle shards + a rolling example buffer here instead.
+        if config.train.shuffle:
+            train_dataset = train_dataset.shuffle(
+                seed=config.datasets.get("shuffle_seed", 42),
+                buffer_size=config.datasets.get("shuffle_buffer_size", 10_000),
+            )
+
+        train_shards = getattr(
+            train_dataset, "num_shards", getattr(train_dataset, "n_shards", "?")
+        )
+        print(f"Streaming training dataset: {train_shards} shards")
+
+        if val_dataset is not None:
+            val_shards = getattr(
+                val_dataset, "num_shards", getattr(val_dataset, "n_shards", "?")
+            )
+            print(f"Streaming validation dataset: {val_shards} shards")
+        else:
+            print(
+                "No validation metadata configured for streaming training; "
+                "the full training stream will be used for optimization."
+            )
+
+        return train_dataset, val_dataset
+
     train_df = pd.read_csv(config.datasets.train_metadata)
 
     if config.datasets.val_metadata == "":

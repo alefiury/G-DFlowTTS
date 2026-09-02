@@ -18,3 +18,5 @@ lion_pytorch
 einops
 unidecode
 xcodec2
+datasets
+soundfile
