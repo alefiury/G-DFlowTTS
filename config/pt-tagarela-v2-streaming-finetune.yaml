@@ -7,8 +7,8 @@ source_dist_type: "mask"
 scheduler_type: "polynomial" # "ko" or "polynomial"
 
 loss:
-    # function: "cross_entropy"
-    function: "generalized_kl"
+    function: "cross_entropy"
+    # function: "generalized_kl"
 
 datasets:
     type: "hf_streaming_text_tokenizer"
@@ -73,6 +73,11 @@ datasets:
     use_eos_as_pad: true
     loss_on_eos_pad: false
 
+    prefix_max_sec: 12
+    prefix_min_sec: 0.25
+    use_prefix_mask: true
+    prefix_ensure_min_gen_sec: 0.5
+
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
     text_vocab_size: ${datasets.text_vocab_size}
@@ -90,13 +95,13 @@ model:
 train:
     batch_size: 32
     shuffle: True
-    num_workers: 12
+    num_workers: 4
 
 optimizer:
     name: "adamw"
     params:
-        min_learning_rate: 1e-6
-        learning_rate: 5e-5
+        min_learning_rate: 1e-4
+        learning_rate: 3e-4
         eps: 1e-8
         weight_decay: 1e-6
         betas: [0.9, 0.999]
@@ -108,14 +113,14 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    max_steps: 1000000
+    max_steps: 500000
     # max_epochs: 3
     num_sanity_val_steps: 2
     overfit_batches: 0.0
     log_every_n_steps: 10
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
-    val_check_interval: 50000
+    val_check_interval: 5000
     accumulate_grad_batches: 1
     precision: bf16
 
