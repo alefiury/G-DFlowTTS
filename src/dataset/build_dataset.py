@@ -4,6 +4,7 @@ from typing import Tuple
 from tqdm import tqdm
 import pandas as pd
 from datasets import load_dataset
+from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from transformers import AutoFeatureExtractor
 
@@ -14,6 +15,59 @@ from dataset.dataloader import (
     HFTextTokenizerDataset,
     PhonemesDataset
 )
+
+
+def _has_non_empty_text(text) -> bool:
+    """Row-level predicate used by IterableDataset.filter (runs lazily, in
+    the DataLoader workers). Module-level so it pickles for spawn workers."""
+    return text is not None and bool(str(text).strip())
+
+
+def _apply_streaming_filters(dataset, config, split_name: str):
+    """Lazy, per-row filtering of a streamed IterableDataset.
+
+    Nothing is materialized: the predicate is evaluated inside the DataLoader
+    workers as rows are pulled from the Parquet shards.
+
+    Config keys (all optional, under ``datasets``):
+
+    filters:
+        List of ``[column, op, value]`` triples in pyarrow DNF form, e.g.
+        ``[[language, "==", pt], [stt_parakeet, "!=", ""]]``.
+        These are pushed down into the Parquet reader (``load_dataset(...,
+        filters=...)``) so rejected rows are dropped *before* the audio column
+        is decoded. Comparisons against NULL evaluate to NULL and are dropped,
+        so ``!= ""`` also removes missing values. Requires datasets>=2.19.
+        Applied in ``build_dataset`` at load time, listed here for reference.
+
+    drop_empty_text (default: true):
+        Additionally drop rows whose ``text_column`` is null, empty or
+        whitespace-only, using ``IterableDataset.filter`` on that single
+        column. Catches whitespace-only strings the Arrow filter lets through.
+    """
+    text_column = config.datasets.get("text_column", None)
+    if config.datasets.get("drop_empty_text", True) and text_column:
+        dataset = dataset.filter(
+            _has_non_empty_text,
+            input_columns=[text_column],
+        )
+        print(
+            f"Streaming {split_name} dataset: dropping rows with empty "
+            f"'{text_column}'"
+        )
+    return dataset
+
+
+def _pushdown_filters(config):
+    """Convert ``datasets.filters`` from the YAML into pyarrow DNF triples."""
+    filters = config.datasets.get("filters", None)
+    if not filters:
+        return None
+    filters = OmegaConf.to_container(filters, resolve=True)
+    # Accept a flat list of triples (AND) or a list of lists (OR of ANDs).
+    if filters and isinstance(filters[0][0], (list, tuple)):
+        return [[tuple(f) for f in group] for group in filters]
+    return [tuple(f) for f in filters]
 
 
 def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
@@ -28,14 +82,27 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
         if val_metadata:
             data_files["validation"] = val_metadata
 
+        load_kwargs = {}
+        pushdown = _pushdown_filters(config)
+        if pushdown is not None:
+            # Predicate pushdown into the Parquet reader: filtered-out rows
+            # never reach Python nor the audio decoder.
+            load_kwargs["filters"] = pushdown
+            print(f"Streaming Parquet row filters (pushdown): {pushdown}")
+
         dataset = load_dataset(
             "parquet",
             data_files=data_files,
             streaming=True,
+            **load_kwargs,
         )
 
-        train_dataset = dataset["train"]
-        val_dataset = dataset["validation"] if val_metadata else None
+        train_dataset = _apply_streaming_filters(dataset["train"], config, "training")
+        val_dataset = (
+            _apply_streaming_filters(dataset["validation"], config, "validation")
+            if val_metadata
+            else None
+        )
 
         # torch DataLoader cannot randomly shuffle an IterableDataset.
         # Shuffle shards + a rolling example buffer here instead.

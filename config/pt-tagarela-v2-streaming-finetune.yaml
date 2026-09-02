@@ -25,6 +25,19 @@ datasets:
 
     audio_column: "audio"
     text_column: "stt_parakeet"
+
+    # Row filters, evaluated lazily while streaming (inside the DataLoader
+    # workers); nothing is loaded into memory. Each entry is
+    # [column, op, value] with op in ==, !=, <, <=, >, >=, in, not in.
+    # They are pushed down into the Parquet reader, so rejected rows are
+    # dropped before their audio is decoded. Comparing against a NULL yields
+    # NULL (dropped), so `!= ""` also removes missing values.
+    filters:
+        - ["language", "==", "pt"]
+        - ["stt_parakeet", "!=", ""]
+
+    # Also drop rows whose text_column is null/empty/whitespace-only.
+    drop_empty_text: true
     shuffle_seed: 42
     shuffle_buffer_size: 10000
 
