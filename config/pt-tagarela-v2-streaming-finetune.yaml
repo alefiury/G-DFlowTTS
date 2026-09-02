@@ -29,9 +29,10 @@ datasets:
     # Row filters, evaluated lazily while streaming (inside the DataLoader
     # workers); nothing is loaded into memory. Each entry is
     # [column, op, value] with op in ==, !=, <, <=, >, >=, in, not in.
-    # They are pushed down into the Parquet reader, so rejected rows are
-    # dropped before their audio is decoded. Comparing against a NULL yields
-    # NULL (dropped), so `!= ""` also removes missing values.
+    # With datasets>=2.19 they are pushed down into the Parquet reader, so
+    # rejected rows are dropped before their audio is decoded; older versions
+    # evaluate the same predicates lazily in Python. Comparing against a NULL
+    # is always False, so `!= ""` also removes missing values.
     filters:
         - ["language", "==", "pt"]
         - ["stt_parakeet", "!=", ""]

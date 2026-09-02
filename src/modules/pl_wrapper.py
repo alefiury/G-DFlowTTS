@@ -161,6 +161,9 @@ class DFMTTSWrapper(L.LightningModule):
         or cause an unnecessary CPU -> GPU -> CPU round trip.
         """
         if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            if batch is None:
+                # Every sample in the batch failed to decode; skip it.
+                return None
             waveforms, transcription_ids, transcription_att_mask = batch
             return (
                 waveforms,
@@ -236,6 +239,7 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_column=self.config.datasets.get("audio_column", "audio"),
                 sampling_rate=self.config.datasets.sampling_rate,
                 max_audio_duration=self.config.datasets.max_audio_duration,
+                id_column=self.config.datasets.get("filepath_column", "filepath"),
             )
         elif self.config.datasets.type == "hf_text_tokenizer":
             print("\n\n\tUsing HF Text Tokenizer Collator for training dataloader!\n\n")
@@ -348,6 +352,7 @@ class DFMTTSWrapper(L.LightningModule):
                 audio_column=self.config.datasets.get("audio_column", "audio"),
                 sampling_rate=self.config.datasets.sampling_rate,
                 max_audio_duration=self.config.datasets.max_audio_duration,
+                id_column=self.config.datasets.get("filepath_column", "filepath"),
             )
         elif self.config.datasets.type == "hf_text_tokenizer":
             print("\n\n\tUsing HF Text Tokenizer Collator for validation dataloader!\n\n")
@@ -673,6 +678,9 @@ class DFMTTSWrapper(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            if batch is None:
+                # Collator dropped every sample (undecodable audio); skip step.
+                return None
             input_waveforms, transcription_ids, transcription_att_mask = batch
             x_1, audio_att_mask = self.encode_streaming_waveforms(input_waveforms)
             x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)
@@ -782,6 +790,9 @@ class DFMTTSWrapper(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         if self.config.datasets.type == "hf_streaming_text_tokenizer":
+            if batch is None:
+                # Collator dropped every sample (undecodable audio); skip step.
+                return None
             input_waveforms, transcription_ids, transcription_att_mask = batch
             x_1, audio_att_mask = self.encode_streaming_waveforms(input_waveforms)
             x_0 = self.source_distribution.sample(x_1.shape, device=x_1.device)

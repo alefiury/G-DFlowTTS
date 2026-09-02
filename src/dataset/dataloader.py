@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import random
@@ -8,7 +9,9 @@ from typing import List, Tuple, Optional
 
 import torch
 import torchaudio
+import numpy as np
 import pandas as pd
+import soundfile as sf
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 from torch.nn.utils.rnn import pad_sequence
@@ -1138,6 +1141,12 @@ class StreamingHFTextTokenizerCollator:
     Codec tokenization intentionally stays out of DataLoader workers and is run
     by the LightningModule on the training device. This avoids loading a large
     NeuCodec model once per worker and preserves per-utterance codec padding.
+
+    Audio is decoded here with soundfile from the raw bytes stored in the
+    Parquet ``audio`` column (``Audio(decode=False)``), bypassing torchcodec.
+    Rows whose audio cannot be decoded are logged and dropped instead of
+    crashing the DataLoader worker. If every row in a batch is dropped the
+    collator returns ``None`` and the LightningModule skips that step.
     """
 
     def __init__(
@@ -1147,24 +1156,64 @@ class StreamingHFTextTokenizerCollator:
         audio_column: str = "audio",
         sampling_rate: int = 16_000,
         max_audio_duration: Optional[float] = None,
+        id_column: Optional[str] = "filepath",
     ):
         self.text_tokenizer = text_tokenizer
         self.text_column = text_column
         self.audio_column = audio_column
         self.sampling_rate = sampling_rate
+        self.id_column = id_column
         self.max_audio_frames = (
             int(max_audio_duration * sampling_rate)
             if max_audio_duration is not None
             else None
         )
 
-    def _prepare_waveform(self, audio) -> torch.Tensor:
-        waveform = torch.tensor(audio["array"], dtype=torch.float32)
-        source_sr = int(audio["sampling_rate"])
+    @staticmethod
+    def _decode_audio(audio) -> Tuple[np.ndarray, int]:
+        """Return ``(samples[T] or [T, C] float32, sampling_rate)``.
 
-        # Hugging Face Audio is normally mono here, but keep stereo robust.
+        Accepts the ``Audio(decode=False)`` dict (``bytes``/``path``) and, for
+        robustness, an already decoded ``array``/``sampling_rate`` dict.
+        """
+        if isinstance(audio, dict) and audio.get("array") is not None:
+            return (
+                np.asarray(audio["array"], dtype=np.float32),
+                int(audio["sampling_rate"]),
+            )
+
+        if isinstance(audio, dict):
+            source = audio.get("bytes")
+            if source is None:
+                source = audio.get("path")
+            if source is None:
+                raise ValueError("Audio sample has neither 'bytes' nor 'path'")
+        elif isinstance(audio, (bytes, bytearray, str)):
+            source = audio
+        else:
+            raise TypeError(f"Unsupported audio sample type {type(audio)!r}")
+
+        if isinstance(source, (bytes, bytearray)):
+            source = io.BytesIO(source)
+
+        data, sr = sf.read(source, dtype="float32", always_2d=False)
+        return data, int(sr)
+
+    def _sample_id(self, sample) -> str:
+        if self.id_column and sample.get(self.id_column) is not None:
+            return str(sample[self.id_column])
+        audio = sample.get(self.audio_column)
+        if isinstance(audio, dict) and audio.get("path"):
+            return str(audio["path"])
+        return "<unknown>"
+
+    def _prepare_waveform(self, audio) -> torch.Tensor:
+        data, source_sr = self._decode_audio(audio)
+        waveform = torch.from_numpy(np.ascontiguousarray(data))
+
+        # soundfile returns [T, C] for multi-channel audio; downmix to mono.
         if waveform.ndim == 2:
-            waveform = waveform.mean(dim=0)
+            waveform = waveform.mean(dim=1)
         if waveform.ndim != 1:
             raise ValueError(
                 f"Expected mono waveform, got shape {tuple(waveform.shape)}"
@@ -1208,10 +1257,21 @@ class StreamingHFTextTokenizerCollator:
 
                 print(f"Empty transcription in column '{self.text_column}'.")
 
-            waveforms.append(
-                self._prepare_waveform(sample[self.audio_column])
-            )
+            try:
+                waveform = self._prepare_waveform(sample[self.audio_column])
+            except Exception as exc:  # noqa: BLE001 - any decode failure
+                print(
+                    "Dropping undecodable audio sample "
+                    f"'{self._sample_id(sample)}': {type(exc).__name__}: {exc}"
+                )
+                continue
+
+            waveforms.append(waveform)
             transcriptions.append(str(transcription))
+
+        if not waveforms:
+            print("All samples in this batch were dropped; skipping batch.")
+            return None
 
         transcription_encodings = self.text_tokenizer(
             transcriptions,
