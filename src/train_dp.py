@@ -4,14 +4,13 @@ import argparse
 
 import wandb
 import torch
-import torchaudio
 from omegaconf import OmegaConf
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from modules.dp_wrapper import DurationPredictorWrapper
+from modules.wrappers.dp_wrapper import DurationPredictorWrapper
 
 torch.autograd.set_detect_anomaly(True) # for debugging
 

@@ -6,7 +6,6 @@ __pycache__/
 # C extensions
 *.so
 
-vocab.json
 wandb/
 samples/
 DFM-TTS/
@@ -18,6 +17,8 @@ checkpoints/
 *.wav
 *.flac
 *.ogg
+# Keep the reference prompts used by the inference scripts
+!src/refs/**
 *.ckpt
 *.safetensors
 *.csv

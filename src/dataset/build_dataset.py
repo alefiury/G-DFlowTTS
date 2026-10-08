@@ -1,4 +1,6 @@
 import os
+import glob
+import fnmatch
 import operator
 from typing import Tuple
 
@@ -7,12 +9,8 @@ import pandas as pd
 from datasets import Audio, load_dataset
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-from transformers import AutoFeatureExtractor
 
-from utils.tokenizer import VoiceBpeTokenizer
 from dataset.dataloader import (
-    DynamicSingleSpeakerDataset,
-    OfflineMultipleSpeakerDataset,
     HFTextTokenizerDataset,
     PhonemesDataset
 )
@@ -132,7 +130,123 @@ class _DNFRowFilter:
         return False
 
 
+def _streaming_load_kwargs(config):
+    """Translate ``datasets.filters`` into ``load_dataset`` kwargs (Parquet
+    predicate pushdown) or, for older ``datasets``, into a lazy row filter."""
+    load_kwargs = {}
+    row_filter = None
+    dnf = _pushdown_filters(config)
+    if dnf is not None:
+        if _parquet_builder_supports_filters():
+            # Predicate pushdown into the Parquet reader: filtered-out
+            # rows never reach Python nor the audio decoder.
+            load_kwargs["filters"] = dnf
+            print(f"Streaming Parquet row filters (pushdown): {dnf}")
+        else:
+            # Older `datasets`: evaluate the same predicates lazily with
+            # IterableDataset.filter inside the DataLoader workers.
+            row_filter = _DNFRowFilter(dnf)
+            print(
+                "Streaming Parquet row filters (python fallback, "
+                f"datasets<2.19): {dnf}"
+            )
+    return load_kwargs, row_filter
+
+
+def _finalize_streaming_splits(train_dataset, val_dataset, config):
+    """Shuffle the training stream and log the shard layout."""
+    # torch DataLoader cannot randomly shuffle an IterableDataset.
+    # Shuffle shards + a rolling example buffer here instead.
+    if config.train.shuffle:
+        train_dataset = train_dataset.shuffle(
+            seed=config.datasets.get("shuffle_seed", 42),
+            buffer_size=config.datasets.get("shuffle_buffer_size", 10_000),
+        )
+
+    train_shards = getattr(
+        train_dataset, "num_shards", getattr(train_dataset, "n_shards", "?")
+    )
+    print(f"Streaming training dataset: {train_shards} shards")
+
+    if val_dataset is not None:
+        val_shards = getattr(
+            val_dataset, "num_shards", getattr(val_dataset, "n_shards", "?")
+        )
+        print(f"Streaming validation dataset: {val_shards} shards")
+    else:
+        print(
+            "No validation data configured for streaming training; "
+            "the full training stream will be used for optimization."
+        )
+
+    return train_dataset, val_dataset
+
+
+def _list_codes_shards(config):
+    """Sorted Parquet shards of a codes dataset, from the Hugging Face Hub
+    (``hf_dataset_name``) or from a local glob (``train_metadata``)."""
+    if config.datasets.get("hf_dataset_name", ""):
+        from huggingface_hub import HfApi
+
+        pattern = config.datasets.get("hf_data_files", "data/train-*.parquet")
+        files = HfApi().list_repo_files(
+            config.datasets.hf_dataset_name,
+            repo_type="dataset",
+            revision=config.datasets.get("hf_revision", None),
+        )
+        return sorted(f for f in files if fnmatch.fnmatch(f, pattern))
+    return sorted(glob.glob(config.datasets.train_metadata))
+
+
+def _build_streaming_codes_dataset(config):
+    """Stream a dataset whose rows already hold codec tokens, e.g.
+    ``neuphonic/emilia-yodas-english-neucodec`` (``text`` + ``codes``).
+
+    Validation is drawn from held-out shards (the last ``val_num_shards``),
+    so no training row is ever used for validation and the training stream
+    keeps shard-level shuffling.
+    """
+    shards = _list_codes_shards(config)
+    if not shards:
+        raise ValueError("No Parquet shards found for the streaming codes dataset.")
+
+    val_num_samples = int(config.datasets.get("val_num_samples", 0))
+    val_num_shards = int(config.datasets.get("val_num_shards", 1)) if val_num_samples > 0 else 0
+    if val_num_shards >= len(shards):
+        raise ValueError(
+            f"val_num_shards={val_num_shards} leaves no training shards "
+            f"(found {len(shards)})."
+        )
+
+    data_files = {"train": shards[: len(shards) - val_num_shards]}
+    if val_num_shards > 0:
+        data_files["validation"] = shards[len(shards) - val_num_shards:]
+
+    load_kwargs, row_filter = _streaming_load_kwargs(config)
+    dataset = load_dataset(
+        config.datasets.get("hf_dataset_name", "") or "parquet",
+        data_files=data_files,
+        revision=config.datasets.get("hf_revision", None),
+        streaming=True,
+        **load_kwargs,
+    )
+
+    train_dataset = _apply_streaming_filters(
+        dataset["train"], config, "training", row_filter
+    )
+    val_dataset = None
+    if val_num_shards > 0:
+        val_dataset = _apply_streaming_filters(
+            dataset["validation"], config, "validation", row_filter
+        ).take(val_num_samples)
+
+    return _finalize_streaming_splits(train_dataset, val_dataset, config)
+
+
 def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
+    if config.datasets.type == "hf_streaming_codes":
+        return _build_streaming_codes_dataset(config)
+
     # Streaming Parquet path: keep the Hugging Face IterableDataset lazy and
     # avoid materializing metadata/audio in RAM.
     if config.datasets.type == "hf_streaming_text_tokenizer":
@@ -144,23 +258,7 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
         if val_metadata:
             data_files["validation"] = val_metadata
 
-        load_kwargs = {}
-        row_filter = None
-        dnf = _pushdown_filters(config)
-        if dnf is not None:
-            if _parquet_builder_supports_filters():
-                # Predicate pushdown into the Parquet reader: filtered-out
-                # rows never reach Python nor the audio decoder.
-                load_kwargs["filters"] = dnf
-                print(f"Streaming Parquet row filters (pushdown): {dnf}")
-            else:
-                # Older `datasets`: evaluate the same predicates lazily with
-                # IterableDataset.filter inside the DataLoader workers.
-                row_filter = _DNFRowFilter(dnf)
-                print(
-                    "Streaming Parquet row filters (python fallback, "
-                    f"datasets<2.19): {dnf}"
-                )
+        load_kwargs, row_filter = _streaming_load_kwargs(config)
 
         dataset = load_dataset(
             "parquet",
@@ -190,31 +288,7 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
             else None
         )
 
-        # torch DataLoader cannot randomly shuffle an IterableDataset.
-        # Shuffle shards + a rolling example buffer here instead.
-        if config.train.shuffle:
-            train_dataset = train_dataset.shuffle(
-                seed=config.datasets.get("shuffle_seed", 42),
-                buffer_size=config.datasets.get("shuffle_buffer_size", 10_000),
-            )
-
-        train_shards = getattr(
-            train_dataset, "num_shards", getattr(train_dataset, "n_shards", "?")
-        )
-        print(f"Streaming training dataset: {train_shards} shards")
-
-        if val_dataset is not None:
-            val_shards = getattr(
-                val_dataset, "num_shards", getattr(val_dataset, "n_shards", "?")
-            )
-            print(f"Streaming validation dataset: {val_shards} shards")
-        else:
-            print(
-                "No validation metadata configured for streaming training; "
-                "the full training stream will be used for optimization."
-            )
-
-        return train_dataset, val_dataset
+        return _finalize_streaming_splits(train_dataset, val_dataset, config)
 
     train_df = pd.read_csv(config.datasets.train_metadata)
 
@@ -236,45 +310,7 @@ def build_dataset(config: dict) -> Tuple[DataLoader, DataLoader]:
     print(f"Number of validation samples: {len(val_df)}")
 
 
-    if config.datasets.type == "dynamic":
-        speech_processor = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
-
-        train_dataset = DynamicSingleSpeakerDataset(
-            data=train_df,
-            base_dir=config.datasets.base_dir,
-            text_tokenizer=text_tokenizer,
-            sampling_rate=config.datasets.sampling_rate,
-            max_audio_duration=config.datasets.max_audio_duration,
-            speech_processor=speech_processor,
-        )
-
-        val_dataset = DynamicSingleSpeakerDataset(
-            data=val_df,
-            base_dir=config.datasets.base_dir,
-            text_tokenizer=text_tokenizer,
-            sampling_rate=config.datasets.sampling_rate,
-            max_audio_duration=config.datasets.max_audio_duration,
-            speech_processor=speech_processor,
-        )
-    elif config.datasets.type == "offline" or \
-        config.datasets.type == "offline_dynamic_dur" or \
-        config.datasets.type == "offline_voice_cloning_simplified":
-        text_tokenizer = VoiceBpeTokenizer(vocab_file=config.datasets.vocab_file)
-
-        train_dataset = OfflineMultipleSpeakerDataset(
-            data=train_df,
-            base_dir=config.datasets.base_dir,
-            filepath_column=config.datasets.filepath_column,
-            text_tokenizer=text_tokenizer,
-        )
-
-        val_dataset = OfflineMultipleSpeakerDataset(
-            data=val_df,
-            base_dir=config.datasets.base_dir,
-            filepath_column=config.datasets.filepath_column,
-            text_tokenizer=text_tokenizer,
-        )
-    elif config.datasets.type == "hf_text_tokenizer":
+    if config.datasets.type == "hf_text_tokenizer":
         train_dataset = HFTextTokenizerDataset(
             data=train_df,
             base_dir=config.datasets.base_dir,

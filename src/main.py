@@ -11,7 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
-from modules.pl_wrapper import DFMTTSWrapper
+from modules.wrappers.pl_wrapper import DFMTTSWrapper
 
 torch.autograd.set_detect_anomaly(True) # for debugging
 
@@ -98,6 +98,9 @@ def main() -> None:
     no_streaming_validation = (
         config.datasets.type == "hf_streaming_text_tokenizer"
         and not config.datasets.get("val_metadata", "")
+    ) or (
+        config.datasets.type == "hf_streaming_codes"
+        and int(config.datasets.get("val_num_samples", 0)) <= 0
     )
 
     checkpoint_config = OmegaConf.to_container(

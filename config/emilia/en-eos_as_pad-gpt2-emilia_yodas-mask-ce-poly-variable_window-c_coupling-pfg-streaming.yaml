@@ -1,4 +1,4 @@
-title: DFMTTS-EmiliaYodas-NeuCodec-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
+title: DFMTTS-EmiliaYodas-Streaming-NeuCodec-C-Coupling-(CondProb-${datasets.cond_drop_prob})-(Dist-${source_dist_type})-${loss.function}-(PadType-${datasets.audio_pad_type})-(EOS-PAD-${datasets.use_eos_as_pad})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})-(wd-${optimizer.params.weight_decay})
 wandb_project_name: "DFM-TTS"
 wandb_entity: "alefiury"
 
@@ -11,14 +11,41 @@ loss:
     # function: "generalized_kl"
 
 datasets:
-    type: "hf_text_tokenizer"
+    type: "hf_streaming_codes"
 
     text_tokenizer_name: "openai-community/gpt2"
 
-    train_metadata: "/raid/aluno_alef/DATASETS/emilia-yodas-english-neucodec/metadata.csv"
-    val_metadata: ""
-    base_dir: ""
-    filepath_column: "filepath"
+    # Precomputed NeuCodec codes streamed from the Hugging Face Hub; nothing
+    # is downloaded up front. The dataset is gated: accept its terms on the
+    # Hub and authenticate (`huggingface-cli login` or HF_TOKEN) first.
+    # To stream local copies of the shards instead, leave hf_dataset_name
+    # empty and set train_metadata to a glob, e.g. "/data/emilia/train-*.parquet".
+    hf_dataset_name: "neuphonic/emilia-yodas-english-neucodec"
+    hf_data_files: "data/train-*.parquet"
+    train_metadata: ""
+
+    text_column: "text"
+    codes_column: "codes"
+    id_column: "_id"
+
+    # Validation: the last `val_num_shards` shards are held out of training
+    # and `val_num_samples` rows are taken from them. Set val_num_samples: 0
+    # to train on every shard without validation.
+    val_num_samples: 5000
+    val_num_shards: 1
+
+    # Optional row filters, evaluated while streaming. Each entry is
+    # [column, op, value] with op in ==, !=, <, <=, >, >=, in, not in.
+    # Available columns: _id, dnsmos, duration, language, phone_count,
+    # speaker, text. Example:
+    # filters:
+    #     - ["dnsmos", ">=", 3.0]
+    #     - ["duration", "<=", 40.0]
+
+    # Also drop rows whose text_column is null/empty/whitespace-only.
+    drop_empty_text: true
+    shuffle_seed: 42
+    shuffle_buffer_size: 10000
 
     sampling_rate: 16000
     max_audio_duration: 41
@@ -29,7 +56,7 @@ datasets:
     text_vocab_size: 50257
     audio_vocab_size: 65536
 
-    text_filler_token: 50257
+    text_filler_token: 50256 # same as gpt2 eos token
 
     audio_eos_token: 65536
     audio_mask_token: 65537
@@ -37,15 +64,21 @@ datasets:
     mask_prob: [0.0, 1.0]
 
     use_mask: true
-    audio_pad_type: "fixed"
+    audio_pad_type: "variable"
 
-    cond_drop_prob: 0.0 # text drop prob
+    cond_drop_prob: 0.1 # text drop prob
 
     assert_drop_prob: true
     guidance_scale: 0.0
 
     use_eos_as_pad: true
     loss_on_eos_pad: false
+
+    use_prefix_mask: true
+    fps: 50
+    prefix_min_sec: 0.25
+    prefix_max_sec: 12.0
+    prefix_ensure_min_gen_sec: 0.5
 
 model:
     audio_vocab_size: ${datasets.audio_vocab_size}
@@ -56,13 +89,13 @@ model:
     dropout: 0.1
     n_blocks: 12
     audio_add_token: 2 # eos + mask token
-    text_add_token: 1 # filler token
+    text_add_token: 0 # filler token
     audio_pad_token:
     text_pad_token:
     text_filler_token: ${datasets.text_filler_token}
 
 train:
-    batch_size: 32
+    batch_size: 1
     shuffle: True
     num_workers: 12
 
@@ -82,7 +115,8 @@ scheduler:
 
 trainer:
     accelerator: "gpu"
-    max_steps: 500000
+    # max_steps: 500000
+    max_steps: 1000000
     # max_epochs: 3
     num_sanity_val_steps: 2
     overfit_batches: 0.0
@@ -90,7 +124,7 @@ trainer:
     gradient_clip_val: 10.0
     gradient_clip_algorithm: "norm"
     val_check_interval: 50000
-    accumulate_grad_batches: 1
+    accumulate_grad_batches: 4
     precision: bf16
 
 model_checkpoint:
@@ -105,9 +139,9 @@ model_checkpoint:
 
 test:
     log_audio_ref: true
-    nsf: 256
-    max_audio_length: 2048
-    audio_ref_path: "/raid/time_voz/DATASETS_TTS/LibriTTS_R/dev-clean/1462/170138/1462_170138_000001_000004.wav"
+    nsf: 128
+    max_audio_length: 1024
+    audio_ref_path: "./refs/1462_170138_000001_000004.wav"
     text_ref: "He spoke with an extreme Oxford accent, and when he was talking well, his face sometimes wore the rapt expression of a very emotional man listening to music."
     sentences:
         - "Now, as all books not primarily intended as picture-books consist principally of types composed to form letterpress"

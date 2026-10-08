@@ -7,7 +7,7 @@ from flow_matching.path import MixtureDiscreteProbPath
 from flow_matching.solver import MixtureDiscreteEulerSolver
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 
-from modules.flow import MaskedSourceDistribution, UniformSourceDistribution, get_source_distribution
+from modules.gdflowtts.flow import MaskedSourceDistribution, UniformSourceDistribution, get_source_distribution
 
 
 class DFMTTSPosteriorNoCFG(ModelWrapper):
