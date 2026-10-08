@@ -1,20 +1,21 @@
-hangul-romanize==0.1.0
-julius==0.2.7
-librosa==0.10.2.post1
-matplotlib==3.9.2
-num2words==0.5.13
-omegaconf==2.3.0
-pandas==1.5.2
-peft==0.7.1
-phonemizer==3.3.0
-scikit-learn==1.5.2
-scipy==1.14.1
-spacy==3.8.2
-tqdm==4.64.1
-transformers==4.36.0
-wandb==0.13.9
-pypinyin
-lion_pytorch
-einops
-unidecode
-xcodec2
+# Install with: bash prepare_env.sh  (uses uv, picks the right CUDA build of torch)
+#
+# torch/torchaudio are pinned to 2.8: torchaudio>=2.9 moved load/save to
+# torchcodec, which this code base does not use.
+# NeuCodec is loaded through transformers (src/utils/neucodec.py).
+torch==2.8.0
+torchaudio==2.8.0
+
+lightning==2.6.6
+flow_matching==1.0.10
+transformers==5.19.0
+datasets==5.1.0
+huggingface_hub==1.33.0
+omegaconf==2.3.1
+pandas==3.0.6
+numpy==2.5.3
+soundfile==0.14.0
+safetensors==0.8.0
+einops==0.8.2
+tqdm==4.70.1
+wandb==0.30.0

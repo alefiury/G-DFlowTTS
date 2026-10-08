@@ -1,0 +1,157 @@
+title: DFMTTS-TAGARELA-v2-Streaming-NeuCodec-(CondProb-${datasets.cond_drop_prob})-(bs-${train.batch_size})-(LR-${optimizer.params.learning_rate})
+wandb_project_name: "DFM-TTS"
+wandb_entity: "alefiury"
+
+model_type: "dit_adaln"
+source_dist_type: "mask"
+scheduler_type: "polynomial" # "ko" or "polynomial"
+
+loss:
+    function: "cross_entropy"
+    # function: "generalized_kl"
+
+datasets:
+    type: "hf_streaming_text_tokenizer"
+
+    text_tokenizer_name: "openai-community/gpt2"
+
+    # Local Parquet globs are streamed lazily by Hugging Face Datasets.
+    train_metadata: "/raid/time_voz/TAGARELA_v2/data/train-*.parquet"
+
+    # Optional. Leave empty (or omit this key) to train on the complete train
+    # stream with no validation split. The TAGARELA test split is kept for
+    # final evaluation and is not used during training.
+    val_metadata: ""
+
+    audio_column: "audio"
+    text_column: "stt_parakeet"
+
+    # Row filters, evaluated lazily while streaming (inside the DataLoader
+    # workers); nothing is loaded into memory. Each entry is
+    # [column, op, value] with op in ==, !=, <, <=, >, >=, in, not in.
+    # With datasets>=2.19 they are pushed down into the Parquet reader, so
+    # rejected rows are dropped before their audio is decoded; older versions
+    # evaluate the same predicates lazily in Python. Comparing against a NULL
+    # is always False, so `!= ""` also removes missing values.
+    filters:
+        - ["language", "==", "pt"]
+        - ["stt_parakeet", "!=", ""]
+
+    # Also drop rows whose text_column is null/empty/whitespace-only.
+    drop_empty_text: true
+    shuffle_seed: 42
+    shuffle_buffer_size: 10000
+
+    # Kept for compatibility with the older dataset modes; ignored here.
+    base_dir: ""
+    filepath_column: "filepath"
+
+    sampling_rate: 16000
+    max_audio_duration: 41
+
+    codec_name: "neucodec"
+    max_audio_length: 2048 # Aprox. 41 seconds of audio (50 tokens/second)
+
+    text_vocab_size: 50257
+    audio_vocab_size: 65536
+
+    text_filler_token: 50256
+
+    audio_eos_token: 65536
+    audio_mask_token: 65537
+
+    mask_prob: [0.0, 1.0]
+
+    use_mask: true
+    audio_pad_type: "variable"
+
+    cond_drop_prob: 0.1 # text drop prob
+
+    assert_drop_prob: true
+    guidance_scale: 0.0
+
+    use_eos_as_pad: true
+    loss_on_eos_pad: false
+
+    prefix_max_sec: 12
+    prefix_min_sec: 0.25
+    use_prefix_mask: true
+    prefix_ensure_min_gen_sec: 0.5
+
+model:
+    audio_vocab_size: ${datasets.audio_vocab_size}
+    text_vocab_size: ${datasets.text_vocab_size}
+    hidden_size: 768
+    cond_dim: 128
+    n_heads: 12
+    dropout: 0.1
+    n_blocks: 12
+    audio_add_token: 2 # eos + mask token
+    text_add_token: 0 # filler token
+    audio_pad_token:
+    text_pad_token:
+    text_filler_token: ${datasets.text_filler_token}
+
+train:
+    batch_size: 32
+    shuffle: True
+    num_workers: 4
+
+optimizer:
+    name: "adamw"
+    params:
+        min_learning_rate: 1e-4
+        learning_rate: 3e-4
+        eps: 1e-8
+        weight_decay: 1e-6
+        betas: [0.9, 0.999]
+
+scheduler:
+    name: "CosineWarmupLR"
+    params:
+        warmup_lr: 5000
+
+trainer:
+    accelerator: "gpu"
+    max_steps: 500000
+    # max_epochs: 3
+    num_sanity_val_steps: 2
+    overfit_batches: 0.0
+    log_every_n_steps: 10
+    gradient_clip_val: 10.0
+    gradient_clip_algorithm: "norm"
+    val_check_interval: 5000
+    accumulate_grad_batches: 1
+    precision: bf16
+
+model_checkpoint:
+    mode: "min"
+    save_top_k: 2
+    save_last: true
+    save_weights_only: false
+    every_n_train_steps: 10000
+    monitor: "val/loss_epoch"
+    dirpath: "/hadatasets/alef.ferreira/DFM-TTS-2/checkpoints/DFMTTS"
+    filename: "{epoch:02d}-{step:02d}-{val/loss_epoch:.3f}"
+
+test:
+    log_audio_ref: false
+    nsf: 128
+    max_audio_length: 1024
+    audio_ref_path: "/raid/aluno_alef/DFM-TTS-2/brspeech_prompt.wav"
+    text_ref: "Mesmo em suas desabridas paixões carnais, em seus vícios triunfantes."
+    sentences:
+        - "Agora, como a maioria dos livros que não são destinados principalmente a ilustrações, seu conteúdo é composto sobretudo por texto impresso."
+        - "No entanto, não há como eliminar completamente a possibilidade de que as fibras tenham vindo de outra camisa idêntica."
+        - "O treinamento de Oswald como fuzileiro naval, sua experiência anterior com rifles e sua familiaridade com essa arma foram considerados relevantes."
+        - "Mesmo assim, ela tentou tirar a própria vida pressionando contra a garganta as unhas que havia deixado crescer de propósito."
+        - "Sua existência era como uma lente voltada para todos os lados, concentrando todas as alegrias em um único ponto de sua consciência."
+        - "Quando chegou à loja de Maria, entrou pelo pátio e seguiu em direção à porta da cozinha."
+
+tags:
+    - Discrete Flow Matching
+    - Neucodec
+    - EN
+    - GPT2-Tokenization
+    - ${train.batch_size}-BS
+    - LR-${optimizer.params.learning_rate}
